@@ -45,7 +45,7 @@ On Windows / PowerShell 7, these launchers start the local services when needed:
 & ./scripts/claude-hybrid.ps1
 ```
 
-`Start-Filter.ps1` prefers the project's `.venv`, then an existing FCC Python environment. You can set `LEMON_FILTER_PYTHON` explicitly. The Claude launcher scopes environment changes to the child session, selects the local model for each tier, and starts with Read, Write, Edit, Bash, Glob, and Grep to fit the smaller context. Agent permission checks remain in effect.
+`Start-Filter.ps1` prefers the project's `.venv`, then an existing FCC Python environment. You can set `LEMON_FILTER_PYTHON` explicitly. The Claude launcher scopes environment changes to the child session, selects the local model for each tier, and starts with Read, Write, Edit, and Bash to fit the smaller context. Agent permission checks remain in effect.
 
 ### FCC
 

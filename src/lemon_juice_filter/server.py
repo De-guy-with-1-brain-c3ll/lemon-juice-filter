@@ -81,7 +81,8 @@ async def generate(body, wire):
         upstream_messages.append({'role': 'user', 'content':
             'Continue the pending task above. Choose only the NEXT tool action if an operation remains. '
             'Wait for its actual tool_result before continuing. Output ONLY one JSON tool_calls decision, '
-            'or {"final":"answer"} when the task is complete. Never describe hypothetical file operations.'})
+            'or a final-key JSON object containing the ACTUAL answer when the task is complete. '
+            'Never output placeholder words or describe hypothetical file operations.'})
     requested = body.get('max_tokens', body.get('max_completion_tokens', 1024))
     if not isinstance(requested, int) or isinstance(requested, bool) or requested <= 0:
         raise ProtocolError('max_tokens must be a positive integer.')
