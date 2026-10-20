@@ -27,6 +27,7 @@ async def lifespan(app):
         app.state.client = client
         app.state.gate = asyncio.Semaphore(1)
         app.state.completed = 0
+        app.state.last_weight_recovery = float('-inf')
         yield
 
 
@@ -64,6 +65,26 @@ async def models():
         'has_more': False, 'first_id': MODEL, 'last_id': MODEL}
 
 
+async def post_generation(payload):
+    """Recover the observed RyzenAI lost-weights fault once, under the generation gate."""
+    response = await app.state.client.post(UPSTREAM_BASE + '/chat/completions', json=payload)
+    if (response.status_code == 500
+            and 'Weights not loaded in MatMulNBits' in response.text
+            and os.getenv('LEMON_AUTO_RECOVER_WEIGHTS', '1') == '1'
+            and time.monotonic() - app.state.last_weight_recovery >= 60):
+        # Set the cooldown before attempting recovery, including failed reloads.
+        app.state.last_weight_recovery = time.monotonic()
+        log.warning('Reloading configured model after RyzenAI lost-weights fault')
+        for endpoint, options in (
+                ('unload', {'model_name': UPSTREAM_MODEL}),
+                ('load', {'model_name': UPSTREAM_MODEL, 'ctx_size': CONTEXT})):
+            lifecycle = await app.state.client.post(UPSTREAM_BASE + '/' + endpoint, json=options)
+            lifecycle.raise_for_status()
+        response = await app.state.client.post(UPSTREAM_BASE + '/chat/completions', json=payload)
+    response.raise_for_status()
+    return response
+
+
 async def generate(body, wire):
     messages, tools = normalize_request(body, wire)
     choice = body.get('tool_choice', 'auto')
@@ -95,8 +116,7 @@ async def generate(body, wire):
     started = time.monotonic()
     async with app.state.gate:
         for attempt in range(2):
-            response = await app.state.client.post(UPSTREAM_BASE + '/chat/completions', json=payload)
-            response.raise_for_status()
+            response = await post_generation(payload)
             data = response.json()
             try:
                 item = data['choices'][0]

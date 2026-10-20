@@ -82,6 +82,27 @@ class HttpTests(unittest.TestCase):
         self.assertEqual(self.client.post('/v1/messages', json={**self.body, 'model': 'cloud-model'}).status_code, 400)
         self.assertEqual(self.client.get('/health', headers={'Origin': 'https://example.com'}).status_code, 403)
 
+    def test_lost_weights_reloads_only_configured_model_then_retries(self):
+        fault = httpx.Response(500, text='Weights not loaded in MatMulNBits_8_0_0',
+            request=httpx.Request('POST', 'http://localhost/chat/completions'))
+        ok = httpx.Response(200, json={'status': 'success'}, request=httpx.Request('POST', 'http://localhost/load'))
+        mock = AsyncMock(side_effect=[fault, ok, ok, upstream('{"final":"recovered"}')])
+        app.state.client.post = mock
+        self.assertEqual(self.client.post('/v1/messages', json=self.body).status_code, 200)
+        calls = mock.call_args_list
+        self.assertTrue(calls[1].args[0].endswith('/unload'))
+        self.assertEqual(calls[1].kwargs['json'], {'model_name': 'Qwen2.5-Coder-7B-Instruct-Hybrid'})
+        self.assertEqual(calls[2].kwargs['json']['ctx_size'], 32768)
+
+    def test_generic_failure_and_cooldown_do_not_reload(self):
+        import time
+        for message in ('unrelated inference error', 'Weights not loaded in MatMulNBits_8_0_0'):
+            app.state.last_weight_recovery = time.monotonic() if 'Weights' in message else float('-inf')
+            app.state.client.post = AsyncMock(return_value=httpx.Response(500, text=message,
+                request=httpx.Request('POST', 'http://localhost/chat/completions')))
+            self.assertEqual(self.client.post('/v1/messages', json=self.body).status_code, 502)
+            self.assertEqual(app.state.client.post.call_count, 1)
+
 
 if __name__ == '__main__':
     unittest.main()
