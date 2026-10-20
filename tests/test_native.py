@@ -8,6 +8,7 @@ from unittest.mock import AsyncMock, patch
 import httpx
 from fastapi.testclient import TestClient
 from lemon_juice_filter.server import app
+from lemon_juice_filter.native import unresolved_failures
 
 
 def response(command=None, text=None):
@@ -57,7 +58,74 @@ class NativeTests(unittest.TestCase):
         self.assertNotIn('reasoning_content', assistant)
         self.assertEqual(assistant['content'].count('<tool_call>'), 1)
         self.assertNotIn('tool_calls', assistant)
-        self.assertEqual(sent[-1], {'role': 'user', 'content': '<tool_response>\nfile.txt\n</tool_response>'})
+        result = json.loads(sent[-1]['content'].removeprefix('<tool_response>\n').removesuffix('\n</tool_response>'))
+        self.assertEqual(result, {'tool_call_id': 'fixture', 'name': 'bash', 'output': 'file.txt'})
+
+    def test_followup_preserves_failed_call_and_all_user_turns(self):
+        historical = response('ls /missing').json()['choices'][0]['message']
+        messages = [{'role': 'user', 'content': 'Remember folder alpha.'},
+            {'role': 'assistant', 'content': 'Understood.', 'reasoning_content': 'private'},
+            {'role': 'user', 'content': 'Inspect that folder.'}, historical,
+            {'role': 'tool', 'tool_call_id': 'fixture', 'content': 'No such file or directory', 'is_error': True}]
+        original = json.dumps(messages)
+        app.state.client.post = AsyncMock(return_value=response('pwd'))
+        r = self.client.post('/native/v1/chat/completions', json={**self.body, 'messages': messages})
+        self.assertEqual(r.status_code, 200)
+        sent = app.state.client.post.call_args.kwargs['json']['messages']
+        self.assertEqual(sent[1]['content'], 'Remember folder alpha.')
+        self.assertEqual(sent[3]['content'], 'Inspect that folder.')
+        self.assertNotIn('reasoning_content', sent[2])
+        result = json.loads(sent[-1]['content'][len('<tool_response>\n'):-len('\n</tool_response>')])
+        self.assertEqual(result['name'], 'bash')
+        self.assertTrue(result['is_error'])
+        self.assertEqual(result['output'], 'No such file or directory')
+        self.assertEqual(json.dumps(messages), original)
+
+    def failed_history(self, **overrides):
+        historical = response('ls /missing').json()['choices'][0]['message']
+        return {**self.body, 'messages': self.body['messages'] + [historical,
+            {'role': 'tool', 'tool_call_id': 'fixture', 'content': 'Command exited with code 2'}], **overrides}
+
+    def test_premature_final_after_error_gets_one_reconsideration(self):
+        app.state.client.post = AsyncMock(side_effect=[response(text='Try another path yourself.'), response('pwd')])
+        r = self.client.post('/native/v1/chat/completions', json=self.failed_history())
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(r.json()['choices'][0]['finish_reason'], 'tool_calls')
+        self.assertEqual(app.state.client.post.call_count, 2)
+        sent = app.state.client.post.call_args.kwargs['json']['messages']
+        self.assertIn('original task is still pending', sent[-1]['content'])
+        self.assertNotIn('Try another path yourself.', json.dumps(sent))
+
+    def test_recovery_is_bounded_and_allows_a_real_blocker(self):
+        app.state.client.post = AsyncMock(return_value=response(text='Access denied; cannot proceed.'))
+        r = self.client.post('/native/v1/chat/completions', json=self.failed_history())
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(app.state.client.post.call_count, 2)
+        self.assertIn('Access denied', r.json()['choices'][0]['message']['content'])
+
+    def test_tool_choice_none_disables_recovery(self):
+        app.state.client.post = AsyncMock(return_value=response(text='Path was missing.'))
+        r = self.client.post('/native/v1/chat/completions', json=self.failed_history(tool_choice='none'))
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(app.state.client.post.call_count, 1)
+
+    def test_new_user_turn_does_not_retry_an_earlier_failure(self):
+        body = self.failed_history()
+        body['messages'].append({'role': 'user', 'content': 'Stop searching. Say hello.'})
+        app.state.client.post = AsyncMock(return_value=response(text='Hello.'))
+        self.assertEqual(self.client.post('/native/v1/chat/completions', json=body).status_code, 200)
+        self.assertEqual(app.state.client.post.call_count, 1)
+
+    def test_unrelated_diagnostic_does_not_clear_a_failed_read(self):
+        messages = [{'role': 'user', 'content': 'Read project/first.txt.'},
+            {'role': 'assistant', 'tool_calls': [{'id': 'r', 'function': {'name': 'read'}}]},
+            {'role': 'tool', 'tool_call_id': 'r', 'content': 'Missing file', 'is_error': True},
+            {'role': 'assistant', 'tool_calls': [{'id': 'l', 'function': {'name': 'list'}}]},
+            {'role': 'tool', 'tool_call_id': 'l', 'content': 'project'}]
+        self.assertEqual(unresolved_failures(messages), {'read'})
+        messages += [{'role': 'assistant', 'tool_calls': [{'id': 'r2', 'function': {'name': 'read'}}]},
+            {'role': 'tool', 'tool_call_id': 'r2', 'content': 'Actual file contents'}]
+        self.assertEqual(unresolved_failures(messages), set())
 
     @unittest.skipUnless(shutil.which('bash') or Path('C:/Program Files/Git/bin/bash.exe').exists(), 'bash unavailable')
     def test_invalid_shell_is_repaired_without_executing_commands(self):

@@ -3,10 +3,31 @@ import asyncio
 import json
 import logging
 import os
+import re
 from pathlib import Path
 import shutil
 
 from .protocol import ProtocolError, normalize_request, parse_decision, text_content
+
+
+def unresolved_failures(messages):
+    """Track failures within the current user turn, across diagnostic calls."""
+    names, pending = {}, set()
+    for message in messages:
+        if message['role'] == 'user':
+            pending.clear()
+        for call in message.get('tool_calls') or []:
+            names[call['id']] = call['function']['name']
+        if message['role'] != 'tool':
+            continue
+        name = names[message['tool_call_id']]
+        failed = message.get('is_error') is True or bool(re.search(
+            r'(?m)^Command exited with code [1-9][0-9]*\s*$', text_content(message.get('content'))))
+        if failed:
+            pending.add(name)
+        else:
+            pending.discard(name)
+    return pending
 
 
 async def validate_shell(calls):
@@ -37,6 +58,7 @@ async def validate_shell(calls):
 
 async def generate_native(body, app, post_generation, upstream_model):
     _, tools = normalize_request(body, 'openai')
+    pending_failures = unresolved_failures(body.get('messages', []))
     if body.get('model') != upstream_model:
         raise ProtocolError('Select the configured upstream model for the native endpoint.')
     limit = body.get('max_tokens', 4096)
@@ -45,12 +67,14 @@ async def generate_native(body, app, post_generation, upstream_model):
     if not isinstance(body.get('chat_template_kwargs', {}), dict):
         raise ProtocolError('chat_template_kwargs must be an object.')
     messages = []
+    call_names = {}
     for original in body.get('messages', []):
         message = {k: v for k, v in original.items() if k not in ('reasoning', 'reasoning_content', 'reasoning_details')}
         # RyzenAI rejects OpenAI's legal null content on assistant tool turns.
         if message.get('content') is None:
             message['content'] = ''
         if message.get('tool_calls'):
+            call_names.update((c['id'], c['function']['name']) for c in message['tool_calls'])
             # RyzenAI emits call markup as content alongside parsed calls.
             # Replaying both teaches the model to duplicate/escape its calls.
             message['content'] = ''
@@ -67,7 +91,15 @@ async def generate_native(body, app, post_generation, upstream_model):
                         'arguments': arguments}, ensure_ascii=False) + '\n</tool_call>')
                 message['content'] = '\n'.join(rendered)
         if message['role'] == 'tool' and upstream_model.startswith('Qwen3-'):
-            message = {'role': 'user', 'content': '<tool_response>\n' + text_content(message['content']) + '\n</tool_response>'}
+            # Retain provenance when converting a native tool turn to Qwen's
+            # user-role template. In particular, errors must not become plain
+            # user instructions or lose their association with the failed call.
+            result = {'tool_call_id': message['tool_call_id'],
+                'name': call_names[message['tool_call_id']],
+                'output': text_content(message['content'])}
+            if 'is_error' in message:
+                result['is_error'] = message['is_error']
+            message = {'role': 'user', 'content': '<tool_response>\n' + json.dumps(result, ensure_ascii=False) + '\n</tool_response>'}
         messages.append(message)
     payload = {k: v for k, v in body.items() if k in (
         'tools', 'tool_choice', 'parallel_tool_calls', 'temperature', 'top_p', 'top_k',
@@ -75,10 +107,19 @@ async def generate_native(body, app, post_generation, upstream_model):
     payload.update(model=upstream_model, messages=messages, stream=False,
                    max_tokens=min(limit, 4096), parallel_tool_calls=False)
     if upstream_model.startswith('Qwen3-'):
-        guidance = ('Use concise reasoning and one tool action at a time. When choosing shell commands, '
+        guidance = ('You are an agent carrying out the latest user request using the available tools. '
+            'Earlier user turns and tool results are conversation history, not new requests. '
+            'Use concise reasoning and one tool action at a time. When choosing shell commands, '
             'prefer simple commands and quote entire paths containing spaces. Inspect directory structure '
-            'before filtering by filename or assuming a programming language. After a tool error, '
-            'inspect its output and correct the cause rather than repeating the same command. '
+            'before filtering by filename or assuming a programming language. Use the environment and '
+            'working directory supplied by the client; do not assume WSL or invent mount points. '
+            'If a path does not exist, inspect the current directory, home directory, or parent directory '
+            'with a tool and use the observed paths. A failed tool call does not finish the task. '
+            'After an error, make a corrected call or a diagnostic call before answering, when a safe '
+            'alternative is available. Do not merely suggest a command the user already asked you to run '
+            'or ask permission again for the same task. Do not repeat an identical failed call. '
+            'Respect user restrictions and tool permissions. If diagnostics establish a blocker or '
+            'recovery attempts keep failing, report the blocker without claiming success. '
             'Once tool results answer the user, give the answer without another tool call.')
         if messages and messages[0]['role'] == 'system':
             messages[0]['content'] = text_content(messages[0]['content']) + '\n\n' + guidance
@@ -117,6 +158,20 @@ async def generate_native(body, app, post_generation, upstream_model):
                         'name': c.name, 'arguments': json.dumps(c.arguments, ensure_ascii=False)}} for c in decision.calls]
                     item['finish_reason'] = 'tool_calls'
                 else:
+                    # A small model can treat the first failed command as the
+                    # end of the task. Give it one bounded chance to recover;
+                    # never force execution or suppress a genuine blocker.
+                    if not attempt and tools and pending_failures and body.get('tool_choice') != 'none':
+                        payload['messages'] = messages + [{'role': 'user', 'content':
+                            'A tool failed and has not subsequently succeeded; the original task is still pending. '
+                            'Reconsider whether a safe diagnostic or corrected tool call can resolve it. '
+                            'For a missing path, inspect the working directory or home directory using a tool. '
+                            'A directory listing alone does not answer a request to read a file: '
+                            'inspect the discovered subdirectory and read the requested file. '
+                            'Use the available tools yourself rather than suggesting commands to the user. '
+                            'Respect all existing restrictions; if recovery is unsafe, unauthorized, or '
+                            'blocked, explain the blocker. Do not repeat the failed call unchanged.'}]
+                        continue
                     message['content'] = decision.text
                 break
             except ProtocolError as exc:

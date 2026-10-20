@@ -73,11 +73,12 @@ source file beneath a directory whose name contains spaces.
 
 | Check | Result |
 | --- | --- |
-| Unit and HTTP suite | 50 passed |
+| Unit and HTTP suite | 56 passed |
 | Pi → adapter → backend | Passed, 33.4 s summed API time |
 | Claude Code → adapter → backend | Passed, 168 s wall time including failure/recovery |
 | Pi → FCC → adapter → backend | Passed, 33.3 s summed API time |
 | Qwen3-4B native thinking: directory search | Passed |
+| Qwen3-4B native thinking: failed read recovery and user follow-up | Passed |
 | Local translation and validation | 1.79 ms/request |
 
 Processing overhead is the median of three runs of 1,000 iterations with Pi's
@@ -88,6 +89,7 @@ invalid arguments after repair; this model's completion rate remains uneven.
 ```sh
 python -m unittest discover -s tests -v
 python scripts/live_protocol.py  # requires a running adapter and backend
+python scripts/live_multiturn.py  # native route; temporary file recovery and follow-up
 ```
 
 Protocol notes: [`docs/protocol-research.md`](docs/protocol-research.md).
