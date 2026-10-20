@@ -1,7 +1,7 @@
 import json
 import unittest
 
-from lemon_juice_filter.protocol import Call, Decision, ProtocolError, Tool, normalize_request, parse_decision, schema_for_prompt, tool_prompt
+from lemon_juice_filter.protocol import Call, Decision, ProtocolError, Tool, normalize_request, parse_decision, schema_for_prompt, tool_prompt, tool_result_payload
 from lemon_juice_filter.server import anthropic_events, anthropic_message, openai_events, openai_message
 
 READ = Tool('read', '', {'type': 'object', 'properties': {'path': {'type': 'string'}}, 'required': ['path'], 'additionalProperties': False})
@@ -9,6 +9,21 @@ CLAUDE = Tool('Read', '', {'type': 'object', 'properties': {'file_path': {'type'
 
 
 class ProtocolTests(unittest.TestCase):
+    def test_claude_read_display_lines_are_separate_metadata(self):
+        result = tool_result_payload('one', 'Read', '1\tbase=41\n2\t')
+        self.assertEqual(result['content'], 'base=41\n')
+        self.assertEqual(result['first_line_number'], 1)
+        self.assertTrue(result['display_line_numbers_removed'])
+
+    def test_numbered_file_contents_preserve_their_own_numbers(self):
+        result = tool_result_payload('one', 'Read', '7\t1\tactual file contents\n8\tnext')
+        self.assertEqual(result['content'], '1\tactual file contents\nnext')
+
+    def test_other_tools_and_errors_are_not_reformatted(self):
+        for name, error in [('read', False), ('Bash', False), ('Read', True)]:
+            self.assertEqual(tool_result_payload('one', name, '1\tdata', error)['content'], '1\tdata')
+        self.assertEqual(tool_result_payload('one', 'Read', '1\tdata\nplain text')['content'], '1\tdata\nplain text')
+
     def test_prompt_compaction_retains_schema_constraints(self):
         schema = {'type': 'object', 'required': ['path'], 'additionalProperties': False,
             'properties': {'path': {'type': 'string', 'minLength': 1, 'description': 'x' * 800,

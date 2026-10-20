@@ -54,3 +54,9 @@ Claude's full tool manuals are much longer than Pi's and include placeholder
 paths. The model-facing catalog compacts description annotations and omits
 examples/titles/comments. Names, required fields, types, enums, references, and
 other constraints are retained; validation uses the untouched original schema.
+
+Claude Read also returns display lines such as `1\tbase=41`. A hybrid run copied
+these display numbers into a subsequent Write. For successful `Read` results
+whose entire text has consecutive numbered lines, the adapter separates the
+display prefix from the file content and reports the first line number as
+metadata. Other tools, error results, and mixed-format text are left unchanged.

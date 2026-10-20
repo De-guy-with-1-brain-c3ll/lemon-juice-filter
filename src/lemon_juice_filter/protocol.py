@@ -52,6 +52,24 @@ def text_content(content: Any) -> str:
     return '\n'.join(parts)
 
 
+def tool_result_payload(call_id: str, name: str, content: Any, is_error: bool = False) -> dict:
+    text = text_content(content)
+    result = {'id': call_id, 'name': name, 'content': text, 'is_error': is_error}
+    # Claude Read renders file lines as N<TAB>content. Those prefixes are UI
+    # metadata, not file bytes; exposing them as file text misleads small models.
+    if name == 'Read' and not is_error:
+        lines = text.splitlines()
+        matches = [re.fullmatch(r'\s*(\d+)\t(.*)', line) for line in lines]
+        numbered = [match for match in matches if match]
+        if numbered and len(numbered) == len(lines):
+            numbers = [int(match.group(1)) for match in numbered]
+            if numbers == list(range(numbers[0], numbers[0] + len(numbers))):
+                result['content'] = '\n'.join(match.group(2) for match in numbered)
+                result['first_line_number'] = numbers[0]
+                result['display_line_numbers_removed'] = True
+    return result
+
+
 def normalize_request(body: dict, wire: str) -> tuple[list[dict], list[Tool]]:
     tools = []
     for item in body.get('tools') or []:
@@ -86,8 +104,8 @@ def normalize_request(body: dict, wire: str) -> tuple[list[dict], list[Tool]]:
             if call_id not in seen_calls or call_id in seen_results:
                 raise ProtocolError('Unmatched or duplicate tool result ID.')
             seen_results.add(call_id)
-            messages.append({'role': 'user', 'content': json.dumps({'tool_result': {
-                'id': call_id, 'name': names[call_id], 'content': text_content(message.get('content'))}})})
+            messages.append({'role': 'user', 'content': json.dumps({'tool_result':
+                tool_result_payload(call_id, names[call_id], message.get('content'))})})
             continue
         content = message.get('content', '')
         parts = []
@@ -105,8 +123,8 @@ def normalize_request(body: dict, wire: str) -> tuple[list[dict], list[Tool]]:
                     if call_id not in seen_calls or call_id in seen_results:
                         raise ProtocolError('Unmatched or duplicate tool result ID.')
                     seen_results.add(call_id)
-                    parts.append(json.dumps({'tool_result': {'id': call_id, 'name': names[call_id],
-                        'is_error': block.get('is_error', False), 'content': text_content(block.get('content'))}}))
+                    parts.append(json.dumps({'tool_result': tool_result_payload(call_id, names[call_id],
+                        block.get('content'), block.get('is_error', False))}))
                 else:
                     parts.append(text_content([block]))
         else:
