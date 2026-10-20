@@ -98,11 +98,17 @@ async def generate(body, wire):
         systems.append(tool_prompt(tools, choice))
     system = '\n\n'.join(systems)
     upstream_messages = ([{'role': 'system', 'content': system}] if system else []) + transcript
-    if tools:
+    # Tool results already form the next user turn. A fresh "next action"
+    # reminder here displaced the actual task and encouraged redundant calls.
+    last_is_result = bool(transcript and any(
+        transcript[-1]['content'].startswith(prefix) for prefix in ('{"tool_result":', '{"tool_results":')))
+    if tools and not last_is_result:
         upstream_messages.append({'role': 'user', 'content':
             'Continue the pending task above. Choose only the NEXT tool action if an operation remains. '
             'Wait for its actual tool_result before continuing. Output ONLY one JSON tool_calls decision, '
-            'or a final-key JSON object containing the ACTUAL answer when the task is complete. '
+            'or a JSON object with exactly the key "final" containing the ACTUAL answer when the task is complete. '
+            'If the tool_result already contains what the user asked to see, answer from that data now. '
+            'The key "final" belongs at the top level, never inside "tool_calls". '
             'Never output placeholder words or describe hypothetical file operations.'})
     requested = body.get('max_tokens', body.get('max_completion_tokens', 1024))
     if not isinstance(requested, int) or isinstance(requested, bool) or requested <= 0:
@@ -135,7 +141,11 @@ async def generate(body, wire):
                 payload['messages'] = upstream_messages + [
                     {'role': 'assistant', 'content': raw},
                     {'role': 'user', 'content': 'Protocol correction: ' + str(exc) +
-                     ' Return one complete JSON decision using the declared tool schemas. Do not execute anything yourself.'}]
+                     ' Return one complete JSON decision. If the real tool results already answer the user, '
+                     'return exactly one top-level key "final" whose string value is that answer, with no "tool_calls" key. '
+                     'Only use tool_calls when another real operation is needed, with an exact declared name '
+                     'and arguments matching its schema. Do not invent completion tools or run a command '
+                     'merely to announce completion. Do not execute anything yourself.'}]
     usage = data.get('usage') or {}
     app.state.completed += 1
     log.info('completed request=%s wire=%s tools=%s repairs=%d seconds=%.2f',

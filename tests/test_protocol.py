@@ -9,6 +9,24 @@ CLAUDE = Tool('Read', '', {'type': 'object', 'properties': {'file_path': {'type'
 
 
 class ProtocolTests(unittest.TestCase):
+    def test_observed_final_key_is_answer_text(self):
+        result = parse_decision('{"final_key":"50 files"}', [READ], require_envelope=True)
+        self.assertEqual(result.text, '50 files')
+        self.assertFalse(result.calls)
+        with self.assertRaises(ProtocolError):
+            parse_decision('{"final_key":"50 files"}', [READ], choice='required', require_envelope=True)
+
+    def test_final_key_does_not_hide_operations_or_nontext(self):
+        for value in ({'final_key': 'done', 'tool_calls': [{'name': 'undeclared', 'arguments': {}}]},
+                      {'final_key': {'command': 'ls'}}, {'final_key': 'done', 'command': 'ls'}):
+            with self.assertRaises(ProtocolError):
+                parse_decision(json.dumps(value), [READ], require_envelope=True)
+
+    def test_missing_name_and_invalid_function_fail_as_protocol_errors(self):
+        for call in ({'next_action': 'answer', 'directory_path': 'fixture'}, {'function': None}, {'function': 'read'}):
+            with self.assertRaisesRegex(ProtocolError, 'name string'):
+                parse_decision(json.dumps({'tool_calls': [call]}), [READ], require_envelope=True)
+
     def test_claude_read_display_lines_are_separate_metadata(self):
         result = tool_result_payload('one', 'Read', '1\tbase=41\n2\t')
         self.assertEqual(result['content'], 'base=41\n')

@@ -37,7 +37,7 @@ class HttpTests(unittest.TestCase):
         self.assertEqual(response['content'][0]['text'], 'actual contents')
         submitted = mock.call_args.kwargs['json']
         self.assertNotIn('tools', submitted)
-        self.assertIn('actual contents', submitted['messages'][-2]['content'])
+        self.assertIn('actual contents', submitted['messages'][-1]['content'])
 
     def test_repair_once_and_never_emit_invalid_call(self):
         mock = AsyncMock(side_effect=[upstream('{"name":"Read","arguments":{"wrong":"x"}}'), upstream('{"name":"Read","arguments":{"file_path":"x"}}')])
@@ -54,6 +54,20 @@ class HttpTests(unittest.TestCase):
         self.assertEqual(response.status_code, 400)
         self.assertEqual(mock.call_count, 2)
         self.assertNotIn('tool_use', response.text)
+
+    def test_post_tool_completion_repair_allows_final_answer(self):
+        mock = AsyncMock(side_effect=[upstream('{"tool_calls":[{"next_action":"answer","directory_path":"fixture"}]}'),
+            upstream('{"final":"sample-00.txt through sample-49.txt"}')])
+        app.state.client.post = mock
+        body = {**self.body, 'messages': self.body['messages'] + [
+            {'role': 'assistant', 'content': [{'type': 'tool_use', 'id': 'fixture', 'name': 'Read', 'input': {'file_path': 'fixture'}}]},
+            {'role': 'user', 'content': [{'type': 'tool_result', 'tool_use_id': 'fixture', 'content': 'sample-00.txt through sample-49.txt'}]}]}
+        response = self.client.post('/v1/messages', json=body)
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()['stop_reason'], 'end_turn')
+        self.assertEqual(response.json()['content'][0]['text'], 'sample-00.txt through sample-49.txt')
+        correction = mock.call_args.kwargs['json']['messages'][-1]['content']
+        self.assertIn('top-level key "final"', correction)
 
     def test_dependent_batch_is_repaired_before_any_action_is_emitted(self):
         call = {'name': 'Read', 'arguments': {'file_path': 'x'}}
