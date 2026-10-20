@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "lemon-juice-filter"
+version = "0.1.0"
+description = "Turn Lemonade hybrid-model text tool calls into native Pi, Claude Code, and FCC tool protocols."
+requires-python = ">=3.11"
+dependencies = ["fastapi>=0.115,<1", "uvicorn>=0.30,<1", "httpx>=0.27,<1", "jsonschema>=4.23,<5"]
+
+[project.scripts]
+lemon-juice-filter = "lemon_juice_filter.server:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
