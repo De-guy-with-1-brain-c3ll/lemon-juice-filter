@@ -57,6 +57,11 @@ can supply a different system prompt; reliability depends on that prompt and the
 
 Add a custom **OpenAI Chat Completions** provider with base URL `http://127.0.0.1:13306/v1`, any dummy local key, and model `lemon-hybrid`. Use default/no reasoning encoding. FCC handles its usual Anthropic-facing clients while this adapter supplies valid OpenAI tool calls upstream.
 
+On Windows, `scripts/fcc-pi-hybrid.ps1` starts the adapter and FCC, registers the
+provider if needed, and launches Pi through FCC with that explicit model.
+Alternatively, run `python scripts/configure_fcc.py` and select the printed model
+in FCC. Existing global model defaults are preserved.
+
 ## Behavior and limits
 
 - Both `/v1/messages` and `/v1/chat/completions` support complete and SSE responses. `/v1/models`, `/health`, and estimated `/v1/messages/count_tokens` are also available.
@@ -66,6 +71,16 @@ Add a custom **OpenAI Chat Completions** provider with base URL `http://127.0.0.
 - The hybrid's raw output is buffered before tool validation. SSE clients receive pings while waiting; this is not token-by-token model streaming. The first visible output arrives after a complete validated decision.
 - This is text-only. Unsupported image/content types fail explicitly. Extended thinking, server-side tools, Responses API, prompt caching, and exact token counting are not implemented. History is not silently trimmed by the adapter. The 32k figure is the configured backend context, not a claim of full-window quality validation.
 - Schema validation improves protocol reliability, not reasoning ability. A weaker model can still choose the wrong valid action. Keep normal agent permission prompts enabled.
+- This hybrid can also produce invalid arguments after the repair attempt; the
+  request then fails explicitly. Successful file workflows do not imply that
+  every agent session will complete reliably.
+- The observed RyzenAI `Weights not loaded in MatMulNBits` failure triggers one
+  reload of the configured model and one generation retry, with a 60-second
+  cooldown. Other failures are surfaced normally. Set `LEMON_AUTO_RECOVER_WEIGHTS=0`
+  to disable this recovery.
+- Claude Code may display fallback context and cost estimates for this unknown
+  model. The backend remains local with a configured 32k context; those client
+  estimates do not describe its actual capacity or a provider bill.
 - Request logs contain request IDs, tool names, timings, and repair counts; they do not intentionally log prompts, arguments, or file contents. Lemonade and the coding clients have their own logging policies.
 
 ## Tests
