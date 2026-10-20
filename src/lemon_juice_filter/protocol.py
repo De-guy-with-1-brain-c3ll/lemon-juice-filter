@@ -132,6 +132,8 @@ def tool_prompt(tools: list[Tool], choice: Any = None) -> str:
     return (
         'TOOL PROTOCOL: You are connected to a real coding agent. Tools are executed by the client. '
         'Never claim a tool ran before receiving its tool_result. Use the exact declared names and argument keys. '
+        'Choose ONLY the NEXT action. Return exactly ONE tool call per response, then WAIT for its tool_result. '
+        'Never batch dependent operations such as read/write/edit/read into the same response. '
         'For a tool action output ONLY {"tool_calls":[{"name":"NAME","arguments":{...}}]}. '
         'For the final answer output ONLY {"final":"your answer"}. No markdown fences, XML, or explanation outside JSON. '
         'After tool_result, continue the task using the actual result; do not repeat a successful action unnecessarily. '

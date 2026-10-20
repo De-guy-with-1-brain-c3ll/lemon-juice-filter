@@ -55,6 +55,15 @@ class HttpTests(unittest.TestCase):
         self.assertEqual(mock.call_count, 2)
         self.assertNotIn('tool_use', response.text)
 
+    def test_dependent_batch_is_repaired_before_any_action_is_emitted(self):
+        call = {'name': 'Read', 'arguments': {'file_path': 'x'}}
+        mock = AsyncMock(side_effect=[upstream(json.dumps({'tool_calls': [call, call]})), upstream(json.dumps(call))])
+        app.state.client.post = mock
+        response = self.client.post('/v1/messages', json=self.body)
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(len(response.json()['content']), 1)
+        self.assertEqual(mock.call_count, 2)
+
     def test_stream_uses_input_json_and_terminal_tool_reason(self):
         app.state.client.post = AsyncMock(return_value=upstream('{"name":"Read","arguments":{"file_path":"x"}}'))
         response = self.client.post('/v1/messages?beta=true', json={**self.body, 'stream': True})

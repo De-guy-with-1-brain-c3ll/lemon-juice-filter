@@ -82,8 +82,9 @@ async def generate(body, wire):
         raise ProtocolError('max_tokens must be a positive integer.')
     payload = {'model': UPSTREAM_MODEL, 'messages': upstream_messages, 'stream': False,
         'max_tokens': min(requested, MAX_OUTPUT), 'temperature': body.get('temperature', 0)}
-    parallel = body.get('parallel_tool_calls', True) and not (
-        isinstance(choice, dict) and choice.get('disable_parallel_tool_use', False))
+    # Agents may run all returned calls concurrently. Serialize model actions to
+    # preserve read/write/edit dependencies; clients allowing parallelism do not require it.
+    parallel = False
     request_id = uuid.uuid4().hex[:16]
     started = time.monotonic()
     async with app.state.gate:
