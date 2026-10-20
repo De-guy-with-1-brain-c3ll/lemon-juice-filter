@@ -49,6 +49,10 @@ class ProtocolTests(unittest.TestCase):
         text = 'Here is an example: {"name":"read","arguments":{"path":"x"}}'
         self.assertFalse(parse_decision(text, [READ]).calls)
 
+    def test_strict_mode_repairs_narrated_operations(self):
+        with self.assertRaises(ProtocolError):
+            parse_decision('I would read x and write y.', [READ], require_envelope=True)
+
     def test_final_and_choices(self):
         self.assertEqual(parse_decision('{"final":"Done"}', [READ]).text, 'Done')
         with self.assertRaises(ProtocolError):

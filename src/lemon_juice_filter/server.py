@@ -77,6 +77,11 @@ async def generate(body, wire):
         systems.append(tool_prompt(tools, choice))
     system = '\n\n'.join(systems)
     upstream_messages = ([{'role': 'system', 'content': system}] if system else []) + transcript
+    if tools:
+        upstream_messages.append({'role': 'user', 'content':
+            'Continue the pending task above. Choose only the NEXT tool action if an operation remains. '
+            'Wait for its actual tool_result before continuing. Output ONLY one JSON tool_calls decision, '
+            'or {"final":"answer"} when the task is complete. Never describe hypothetical file operations.'})
     requested = body.get('max_tokens', body.get('max_completion_tokens', 1024))
     if not isinstance(requested, int) or isinstance(requested, bool) or requested <= 0:
         raise ProtocolError('max_tokens must be a positive integer.')
@@ -101,7 +106,7 @@ async def generate(body, wire):
                     raw = json.dumps({'tool_calls': native})
                 if item.get('finish_reason') == 'length' and tools:
                     raise ProtocolError('Model output was truncated; reduce the requested operation or increase max_tokens.')
-                decision = parse_decision(raw, tools, choice, parallel)
+                decision = parse_decision(raw, tools, choice, parallel, require_envelope=bool(tools))
                 break
             except ProtocolError as exc:
                 if attempt:

@@ -156,13 +156,15 @@ def _unwrap(text: str) -> str:
     return text
 
 
-def parse_decision(text: str, tools: list[Tool], choice: Any = None, parallel: bool = True) -> Decision:
+def parse_decision(text: str, tools: list[Tool], choice: Any = None, parallel: bool = True, require_envelope: bool = False) -> Decision:
     raw = _unwrap(text)
     try:
         obj = json.loads(raw)
     except json.JSONDecodeError as exc:
         if raw.startswith(('{', '[', '<tool_call>', '<response>')) and re.search(r'"(?:tool_calls|tool_call|arguments)"|<tool_call>|<response>', raw):
             raise ProtocolError('Malformed tool-call JSON; return a complete object.') from exc
+        if require_envelope:
+            raise ProtocolError('Return a JSON tool decision or {"final":"answer"}. If the task requires an operation, call its tool instead of describing or simulating it.') from exc
         return _validate_choice(Decision(text=text), choice)
     if isinstance(obj, dict) and set(obj) == {'final'} and isinstance(obj['final'], str):
         return _validate_choice(Decision(text=obj['final']), choice)
@@ -175,6 +177,8 @@ def parse_decision(text: str, tools: list[Tool], choice: Any = None, parallel: b
     elif isinstance(obj, list) and obj and all(isinstance(x, dict) and ('name' in x or 'function' in x) for x in obj):
         entries = obj
     else:
+        if require_envelope:
+            raise ProtocolError('Expected tool_calls or a final answer envelope; do not simulate tool results.')
         return _validate_choice(Decision(text=text), choice)
     if not isinstance(entries, list) or not entries:
         raise ProtocolError('tool_calls must be a nonempty list.')

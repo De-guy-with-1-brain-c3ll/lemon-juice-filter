@@ -37,7 +37,7 @@ class HttpTests(unittest.TestCase):
         self.assertEqual(response['content'][0]['text'], 'actual contents')
         submitted = mock.call_args.kwargs['json']
         self.assertNotIn('tools', submitted)
-        self.assertIn('actual contents', submitted['messages'][-1]['content'])
+        self.assertIn('actual contents', submitted['messages'][-2]['content'])
 
     def test_repair_once_and_never_emit_invalid_call(self):
         mock = AsyncMock(side_effect=[upstream('{"name":"Read","arguments":{"wrong":"x"}}'), upstream('{"name":"Read","arguments":{"file_path":"x"}}')])
