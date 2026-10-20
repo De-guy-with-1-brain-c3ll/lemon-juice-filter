@@ -16,6 +16,11 @@ class ProtocolTests(unittest.TestCase):
     def test_observed_extra_backticks(self):
         self.assertEqual(parse_decision('```json\n{"name":"read","arguments":{"path":"x"}}\n``````', [READ]).calls[0].name, 'read')
 
+    def test_observed_singular_wrapper_generates_fresh_id(self):
+        call = parse_decision('{"tool_call":{"id":"model-invented","name":"read","arguments":{"path":"x"}}}', [READ]).calls[0]
+        self.assertEqual(call.arguments, {'path': 'x'})
+        self.assertNotEqual(call.id, 'model-invented')
+
     def test_claude_schema_and_case(self):
         self.assertEqual(parse_decision('{"name":"Read","arguments":{"file_path":"x"}}', [CLAUDE]).calls[0].arguments, {'file_path': 'x'})
         with self.assertRaises(ProtocolError):

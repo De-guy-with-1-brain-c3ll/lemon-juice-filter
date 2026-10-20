@@ -99,7 +99,7 @@ def normalize_request(body: dict, wire: str) -> tuple[list[dict], list[Tool]]:
                         raise ProtocolError('Duplicate tool call ID.')
                     seen_calls.add(call_id)
                     names[call_id] = block['name']
-                    parts.append(json.dumps({'tool_call': {'id': call_id, 'name': block['name'], 'arguments': block['input']}}))
+                    parts.append(json.dumps({'tool_calls': [{'id': call_id, 'name': block['name'], 'arguments': block['input']}]}))
                 elif block.get('type') == 'tool_result':
                     call_id = block['tool_use_id']
                     if call_id not in seen_calls or call_id in seen_results:
@@ -122,7 +122,7 @@ def normalize_request(body: dict, wire: str) -> tuple[list[dict], list[Tool]]:
                 arguments = json.loads(arguments) if isinstance(arguments, str) else arguments
             except json.JSONDecodeError as exc:
                 raise ProtocolError('Malformed historical tool arguments.') from exc
-            parts.append(json.dumps({'tool_call': {'id': call_id, 'name': names[call_id], 'arguments': arguments}}))
+            parts.append(json.dumps({'tool_calls': [{'id': call_id, 'name': names[call_id], 'arguments': arguments}]}))
         messages.append({'role': 'system' if role == 'developer' else role, 'content': '\n'.join(parts)})
     return messages, tools
 
@@ -168,6 +168,8 @@ def parse_decision(text: str, tools: list[Tool], choice: Any = None, parallel: b
         return _validate_choice(Decision(text=obj['final']), choice)
     if isinstance(obj, dict) and 'tool_calls' in obj:
         entries = obj['tool_calls']
+    elif isinstance(obj, dict) and set(obj) == {'tool_call'}:
+        entries = [obj['tool_call']]
     elif isinstance(obj, dict) and 'name' in obj and ('arguments' in obj or 'input' in obj):
         entries = [obj]
     elif isinstance(obj, list) and obj and all(isinstance(x, dict) and ('name' in x or 'function' in x) for x in obj):
