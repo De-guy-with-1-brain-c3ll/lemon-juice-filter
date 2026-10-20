@@ -47,6 +47,12 @@ On Windows / PowerShell 7, these launchers start the local services when needed:
 
 `Start-Filter.ps1` prefers the project's `.venv`, then an existing FCC Python environment. You can set `LEMON_FILTER_PYTHON` explicitly. The Claude launcher scopes environment changes to the child session, selects the local model for each tier, and starts with Read, Write, Edit, and Bash to fit the smaller context. Agent permission checks remain in effect.
 
+The Claude launcher supplies a concise local-model system prompt with the real
+working directory. This replaces the much larger default Claude system prompt;
+project-specific instructions should be supplied in the user context as needed.
+It does not add execution permissions or bypass client checks. Direct API use
+can supply a different system prompt; reliability depends on that prompt and the model.
+
 ### FCC
 
 Add a custom **OpenAI Chat Completions** provider with base URL `http://127.0.0.1:13306/v1`, any dummy local key, and model `lemon-hybrid`. Use default/no reasoning encoding. FCC handles its usual Anthropic-facing clients while this adapter supplies valid OpenAI tool calls upstream.

@@ -19,7 +19,15 @@ foreach ($key in $updates.Keys) {
     [Environment]::SetEnvironmentVariable($key, $updates[$key], 'Process')
 }
 try {
-    & claude --model lemon-hybrid --tools 'Read,Write,Edit,Bash' @args
+    $localPrompt = @"
+You are a local coding assistant. Perform the user's requested operations with the supplied tools.
+Read existing files before editing. Use the exact file paths requested by the user, resolved against the working directory below. Never invent example directories or usernames.
+Use one tool action at a time and inspect its actual result before choosing the next action. File display line numbers are metadata, not file contents.
+Never describe an operation as completed unless its tool result confirms success. When all requested steps are complete, report the actual result concisely.
+Follow any project instructions supplied in the user context. Do not change unrelated files.
+Working directory: $((Get-Location).Path)
+"@
+    & claude --model lemon-hybrid --system-prompt $localPrompt --tools 'Read,Write,Edit,Bash' @args
     $result = $LASTEXITCODE
 } finally {
     foreach ($key in $previous.Keys) { [Environment]::SetEnvironmentVariable($key, $previous[$key], 'Process') }
