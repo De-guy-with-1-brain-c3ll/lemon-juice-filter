@@ -135,6 +135,13 @@ def schema_for_prompt(value: Any) -> Any:
         return value
     result = {}
     for key, item in value.items():
+        if key in ('properties', 'patternProperties', '$defs', 'definitions', 'dependentSchemas') and isinstance(item, dict):
+            result[key] = {name: schema_for_prompt(schema) for name, schema in item.items()}
+            continue
+        if key in ('enum', 'const', 'default'):
+            # These are user data, not schema annotations.
+            result[key] = item
+            continue
         if key in ('examples', '$comment', 'title'):
             continue
         if key == 'description' and isinstance(item, str):

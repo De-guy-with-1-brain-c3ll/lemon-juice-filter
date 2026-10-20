@@ -28,6 +28,17 @@ class ProtocolTests(unittest.TestCase):
         self.assertIn('file_path', prompt)
         self.assertNotIn('manual manual', prompt)
 
+    def test_compaction_preserves_fields_named_like_annotations(self):
+        schema = {'type': 'object', 'properties': {
+            'title': {'type': 'string'}, 'description': {'type': 'string'},
+            'examples': {'type': 'array', 'items': {'type': 'string'}}},
+            '$defs': {'title': {'type': 'string'}},
+            'enum': [{'title': 'literal data', 'description': 'y' * 300}]}
+        compact = schema_for_prompt(schema)
+        self.assertEqual(set(compact['properties']), {'title', 'description', 'examples'})
+        self.assertIn('title', compact['$defs'])
+        self.assertEqual(compact['enum'], schema['enum'])
+
     def test_observed_xml(self):
         call = parse_decision('```xml\n<response>{"name":"read","arguments":{"path":"x"}}</response>\n```', [READ]).calls[0]
         self.assertEqual((call.name, call.arguments), ('read', {'path': 'x'}))
