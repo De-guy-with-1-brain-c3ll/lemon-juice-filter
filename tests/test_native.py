@@ -58,8 +58,11 @@ class NativeTests(unittest.TestCase):
         self.assertNotIn('reasoning_content', assistant)
         self.assertEqual(assistant['content'].count('<tool_call>'), 1)
         self.assertNotIn('tool_calls', assistant)
-        result = json.loads(sent[-1]['content'].removeprefix('<tool_response>\n').removesuffix('\n</tool_response>'))
+        observation = next(m for m in reversed(sent) if m['content'].startswith('<tool_response>'))
+        result = json.loads(observation['content'].removeprefix('<tool_response>\n').removesuffix('\n</tool_response>'))
         self.assertEqual(result, {'tool_call_id': 'fixture', 'name': 'bash', 'output': 'file.txt'})
+        self.assertEqual(sent[-1]['role'], 'system')
+        self.assertIn('not user input', sent[-1]['content'])
 
     def test_followup_preserves_failed_call_and_all_user_turns(self):
         historical = response('ls /missing').json()['choices'][0]['message']
@@ -75,7 +78,8 @@ class NativeTests(unittest.TestCase):
         self.assertEqual(sent[1]['content'], 'Remember folder alpha.')
         self.assertEqual(sent[3]['content'], 'Inspect that folder.')
         self.assertNotIn('reasoning_content', sent[2])
-        result = json.loads(sent[-1]['content'][len('<tool_response>\n'):-len('\n</tool_response>')])
+        observation = next(m for m in reversed(sent) if m['content'].startswith('<tool_response>'))
+        result = json.loads(observation['content'][len('<tool_response>\n'):-len('\n</tool_response>')])
         self.assertEqual(result['name'], 'bash')
         self.assertTrue(result['is_error'])
         self.assertEqual(result['output'], 'No such file or directory')
@@ -94,6 +98,7 @@ class NativeTests(unittest.TestCase):
         self.assertEqual(app.state.client.post.call_count, 2)
         sent = app.state.client.post.call_args.kwargs['json']['messages']
         self.assertIn('original task is still pending', sent[-1]['content'])
+        self.assertEqual(sent[-1]['role'], 'system')
         self.assertNotIn('Try another path yourself.', json.dumps(sent))
 
     def test_recovery_is_bounded_and_allows_a_real_blocker(self):
@@ -179,3 +184,22 @@ class NativeTests(unittest.TestCase):
         self.assertEqual(result['finish_reason'], 'tool_calls')
         self.assertIsNone(result['message']['content'])
         self.assertEqual(result['message']['tool_calls'][0]['function']['name'], 'bash')
+
+    def test_protocol_repair_is_not_a_new_user_request(self):
+        app.state.client.post = AsyncMock(side_effect=[response(), response(text='Hello.')])
+        self.assertEqual(self.client.post('/native/v1/chat/completions', json=self.body).status_code, 200)
+        sent = app.state.client.post.call_args.kwargs['json']['messages']
+        self.assertEqual(sent[-1]['role'], 'system')
+        users = [m['content'] for m in sent if m['role'] == 'user']
+        self.assertEqual(users, ['list files'])
+
+    def test_new_request_remains_last_message_without_observation_cue(self):
+        historical = response('ls').json()['choices'][0]['message']
+        messages = self.body['messages'] + [historical,
+            {'role': 'tool', 'tool_call_id': 'fixture', 'content': 'project'},
+            {'role': 'assistant', 'content': 'Found project.'},
+            {'role': 'user', 'content': 'Find its source folder.'}]
+        app.state.client.post = AsyncMock(return_value=response('ls project'))
+        self.assertEqual(self.client.post('/native/v1/chat/completions', json={**self.body, 'messages': messages}).status_code, 200)
+        sent = app.state.client.post.call_args.kwargs['json']['messages']
+        self.assertEqual(sent[-1], messages[-1])

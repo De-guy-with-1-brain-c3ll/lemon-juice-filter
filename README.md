@@ -73,7 +73,7 @@ source file beneath a directory whose name contains spaces.
 
 | Check | Result |
 | --- | --- |
-| Unit and HTTP suite | 56 passed |
+| Unit and HTTP suite | 58 passed |
 | Pi → adapter → backend | Passed, 33.4 s summed API time |
 | Claude Code → adapter → backend | Passed, 168 s wall time including failure/recovery |
 | Pi → FCC → adapter → backend | Passed, 33.3 s summed API time |

@@ -108,7 +108,14 @@ async def generate_native(body, app, post_generation, upstream_model):
                    max_tokens=min(limit, 4096), parallel_tool_calls=False)
     if upstream_model.startswith('Qwen3-'):
         guidance = ('You are an agent carrying out the latest user request using the available tools. '
-            'Earlier user turns and tool results are conversation history, not new requests. '
+            'The declared tools are callable programs connected to the user environment. '
+            'Your tool calls execute there; <tool_response> contains observations from those calls, '
+            'not a message or terminal output supplied by the user. Use observations as evidence '
+            'to choose the next action and answer the actual request. Never infer file contents '
+            'or properties such as encryption from a filename alone. '
+            'When asked to inspect, locate, read, or modify something, perform the operation with '
+            'tools within the existing permissions instead of giving the user steps to perform it. '
+            'Answer greetings and questions that need no tools directly. '
             'Use concise reasoning and one tool action at a time. When choosing shell commands, '
             'prefer simple commands and quote entire paths containing spaces. Inspect directory structure '
             'before filtering by filename or assuming a programming language. Use the environment and '
@@ -130,6 +137,15 @@ async def generate_native(body, app, post_generation, upstream_model):
         payload.setdefault('top_p', 0.95 if thinking else 0.8)
         payload.setdefault('top_k', 20)
         payload.setdefault('min_p', 0)
+        if body.get('messages') and body['messages'][-1]['role'] == 'tool':
+            # Keep the true user request as the template's last_query_index.
+            # A system continuation cue distinguishes an observation from a
+            # fresh request without turning adapter instructions into user turns.
+            messages.append({'role': 'system', 'content':
+                'The preceding tool response is the result of your own action, not user input. '
+                'Continue the latest user request using that observation. If more inspection is '
+                'needed, call a tool. If the request is complete, answer using only verified facts. '
+                'Follow the existing user restrictions and permissions.'})
     if os.getenv('LEMON_NATIVE_DEBUG') == '1':
         logging.getLogger('lemon_juice_filter').info('native request options=%s message_shapes=%s',
             {k: payload.get(k) for k in ('temperature', 'top_p', 'top_k', 'tool_choice', 'chat_template_kwargs')},
@@ -162,7 +178,7 @@ async def generate_native(body, app, post_generation, upstream_model):
                     # end of the task. Give it one bounded chance to recover;
                     # never force execution or suppress a genuine blocker.
                     if not attempt and tools and pending_failures and body.get('tool_choice') != 'none':
-                        payload['messages'] = messages + [{'role': 'user', 'content':
+                        payload['messages'] = messages + [{'role': 'system', 'content':
                             'A tool failed and has not subsequently succeeded; the original task is still pending. '
                             'Reconsider whether a safe diagnostic or corrected tool call can resolve it. '
                             'For a missing path, inspect the working directory or home directory using a tool. '
@@ -177,7 +193,7 @@ async def generate_native(body, app, post_generation, upstream_model):
             except ProtocolError as exc:
                 if attempt:
                     raise ProtocolError('Native output remained invalid after one repair: ' + str(exc)) from exc
-                payload['messages'] = messages + [{'role': 'user', 'content':
+                payload['messages'] = messages + [{'role': 'system', 'content':
                     'Correct the response format or tool arguments: ' + str(exc) +
                     ' Use only the declared tools. Return an actual tool call if work remains, '
                     'or answer the user if the task is finished. Do not repeat a successful operation.'}]
