@@ -49,3 +49,8 @@ The adapter treats this exact one-call, answer-only form as ordinary final text,
 unless the client actually declared a tool named `Final Answer`. Extra operational
 arguments are rejected. Required-tool choices still reject a final answer. No
 model-supplied ID is trusted or used for tool execution.
+
+Claude's full tool manuals are much longer than Pi's and include placeholder
+paths. The model-facing catalog compacts description annotations and omits
+examples/titles/comments. Names, required fields, types, enums, references, and
+other constraints are retained; validation uses the untouched original schema.

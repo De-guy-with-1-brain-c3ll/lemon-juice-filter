@@ -127,8 +127,28 @@ def normalize_request(body: dict, wire: str) -> tuple[list[dict], list[Tool]]:
     return messages, tools
 
 
+def schema_for_prompt(value: Any) -> Any:
+    """Compact documentation only; preserve every validation constraint."""
+    if isinstance(value, list):
+        return [schema_for_prompt(item) for item in value]
+    if not isinstance(value, dict):
+        return value
+    result = {}
+    for key, item in value.items():
+        if key in ('examples', '$comment', 'title'):
+            continue
+        if key == 'description' and isinstance(item, str):
+            result[key] = item.split('\n\n', 1)[0][:160]
+        else:
+            result[key] = schema_for_prompt(item)
+    return result
+
+
 def tool_prompt(tools: list[Tool], choice: Any = None) -> str:
-    definitions = [{'name': t.name, 'description': t.description, 'parameters': t.schema} for t in tools]
+    # Large CLI tool manuals and placeholder examples distract the small model.
+    # The original, complete schema still validates every emitted argument.
+    definitions = [{'name': t.name, 'description': t.description.split('\n\n', 1)[0][:320],
+                    'parameters': schema_for_prompt(t.schema)} for t in tools]
     return (
         'TOOL PROTOCOL: You are connected to a real coding agent. Tools are executed by the client. '
         'Never claim a tool ran before receiving its tool_result. Use the exact declared names and argument keys. '

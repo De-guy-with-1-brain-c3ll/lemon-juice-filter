@@ -1,7 +1,7 @@
 import json
 import unittest
 
-from lemon_juice_filter.protocol import Call, Decision, ProtocolError, Tool, normalize_request, parse_decision
+from lemon_juice_filter.protocol import Call, Decision, ProtocolError, Tool, normalize_request, parse_decision, schema_for_prompt, tool_prompt
 from lemon_juice_filter.server import anthropic_events, anthropic_message, openai_events, openai_message
 
 READ = Tool('read', '', {'type': 'object', 'properties': {'path': {'type': 'string'}}, 'required': ['path'], 'additionalProperties': False})
@@ -9,6 +9,25 @@ CLAUDE = Tool('Read', '', {'type': 'object', 'properties': {'file_path': {'type'
 
 
 class ProtocolTests(unittest.TestCase):
+    def test_prompt_compaction_retains_schema_constraints(self):
+        schema = {'type': 'object', 'required': ['path'], 'additionalProperties': False,
+            'properties': {'path': {'type': 'string', 'minLength': 1, 'description': 'x' * 800,
+                'examples': ['/path/to/placeholder'], 'title': 'Path'}}}
+        original = json.dumps(schema)
+        compact = schema_for_prompt(schema)
+        self.assertEqual(compact['required'], ['path'])
+        self.assertFalse(compact['additionalProperties'])
+        self.assertEqual(compact['properties']['path']['minLength'], 1)
+        self.assertEqual(len(compact['properties']['path']['description']), 160)
+        self.assertNotIn('examples', compact['properties']['path'])
+        self.assertEqual(json.dumps(schema), original)
+
+    def test_tool_manual_is_compacted_without_renaming(self):
+        prompt = tool_prompt([Tool('Read', 'Read files.\n\n' + 'manual ' * 1000, CLAUDE.schema)])
+        self.assertIn('"name": "Read"', prompt)
+        self.assertIn('file_path', prompt)
+        self.assertNotIn('manual manual', prompt)
+
     def test_observed_xml(self):
         call = parse_decision('```xml\n<response>{"name":"read","arguments":{"path":"x"}}</response>\n```', [READ]).calls[0]
         self.assertEqual((call.name, call.arguments), ('read', {'path': 'x'}))
