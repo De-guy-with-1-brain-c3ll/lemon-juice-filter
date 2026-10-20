@@ -122,6 +122,8 @@ class HttpTests(unittest.TestCase):
         self.assertTrue(calls[1].args[0].endswith('/unload'))
         self.assertEqual(calls[1].kwargs['json'], {'model_name': 'Qwen2.5-Coder-7B-Instruct-Hybrid'})
         self.assertEqual(calls[2].kwargs['json']['ctx_size'], 32768)
+        self.assertEqual(calls[3].kwargs, calls[0].kwargs)
+        self.assertEqual(calls[3].args, calls[0].args)
 
     def test_generic_failure_and_cooldown_do_not_reload(self):
         import time

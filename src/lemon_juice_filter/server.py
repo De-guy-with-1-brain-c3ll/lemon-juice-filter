@@ -79,10 +79,10 @@ async def post_generation(payload, read_timeout=None):
         # Set the cooldown before attempting recovery, including failed reloads.
         app.state.last_weight_recovery = time.monotonic()
         log.warning('Reloading configured model after RyzenAI lost-weights fault')
-        for endpoint, options in (
+        for endpoint, lifecycle_body in (
                 ('unload', {'model_name': UPSTREAM_MODEL}),
                 ('load', {'model_name': UPSTREAM_MODEL, 'ctx_size': CONTEXT})):
-            lifecycle = await app.state.client.post(UPSTREAM_BASE + '/' + endpoint, json=options)
+            lifecycle = await app.state.client.post(UPSTREAM_BASE + '/' + endpoint, json=lifecycle_body)
             lifecycle.raise_for_status()
         response = await app.state.client.post(UPSTREAM_BASE + '/chat/completions', **options)
     response.raise_for_status()
