@@ -9,6 +9,16 @@ CLAUDE = Tool('Read', '', {'type': 'object', 'properties': {'file_path': {'type'
 
 
 class ProtocolTests(unittest.TestCase):
+    def test_tool_inventory_precedes_protocol_and_uses_client_names(self):
+        prompt = tool_prompt([READ, CLAUDE])
+        inventory = prompt.split('TOOL PROTOCOL:', 1)[0]
+        self.assertTrue(inventory.startswith('AVAILABLE TOOLS'))
+        self.assertIn('- "read":', inventory)
+        self.assertIn('- "Read":', inventory)
+        self.assertIn('"path" (string)', inventory)
+        self.assertIn('"file_path" (string)', inventory)
+        self.assertNotIn('- "locate_folder":', inventory)
+
     def test_observed_final_key_is_answer_text(self):
         result = parse_decision('{"final_key":"50 files"}', [READ], require_envelope=True)
         self.assertEqual(result.text, '50 files')

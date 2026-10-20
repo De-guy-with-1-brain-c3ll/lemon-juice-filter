@@ -174,7 +174,15 @@ def tool_prompt(tools: list[Tool], choice: Any = None) -> str:
     # The original, complete schema still validates every emitted argument.
     definitions = [{'name': t.name, 'description': t.description.split('\n\n', 1)[0][:320],
                     'parameters': schema_for_prompt(t.schema)} for t in tools]
+    inventory = []
+    for tool in tools:
+        properties = tool.schema.get('properties', {})
+        required = ', '.join(json.dumps(name) + ' (' + str(properties.get(name, {}).get('type', 'see schema')) + ')'
+                             for name in tool.schema.get('required', [])) or 'none'
+        summary = tool.description.split('\n', 1)[0][:160]
+        inventory.append(f'- {json.dumps(tool.name)}: {summary} Required arguments: {required}.')
     return (
+        'AVAILABLE TOOLS (use these exact names; there are no other tools):\n' + '\n'.join(inventory) + '\n\n'
         'TOOL PROTOCOL: You are connected to a real coding agent. Tools are executed by the client. '
         'Never claim a tool ran before receiving its tool_result. Use the exact declared names and argument keys. '
         'Choose ONLY the NEXT action. Return exactly ONE tool call per response, then WAIT for its tool_result. '

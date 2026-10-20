@@ -69,6 +69,21 @@ class HttpTests(unittest.TestCase):
         correction = mock.call_args.kwargs['json']['messages'][-1]['content']
         self.assertIn('top-level key "final"', correction)
 
+    def test_followup_repair_repeats_request_and_schemas_without_bad_answer(self):
+        invalid = '{"tool_calls":[{"next_action":"find","directory_path":"fixture"}]}'
+        mock = AsyncMock(side_effect=[upstream(invalid), upstream('{"name":"Read","arguments":{"file_path":"fixture"}}')])
+        app.state.client.post = mock
+        body = {**self.body, 'messages': [{'role': 'user', 'content': 'list files'},
+            {'role': 'assistant', 'content': 'fixture is a directory'},
+            {'role': 'user', 'content': 'find the source inside fixture'}]}
+        response = self.client.post('/v1/messages', json=body)
+        self.assertEqual(response.status_code, 200)
+        sent = mock.call_args.kwargs['json']['messages']
+        self.assertFalse(any(m['content'] == invalid for m in sent))
+        self.assertIn('find the source inside fixture', sent[-1]['content'])
+        self.assertIn('"arguments_schema"', sent[-1]['content'])
+        self.assertIn('"file_path"', sent[-1]['content'])
+
     def test_dependent_batch_is_repaired_before_any_action_is_emitted(self):
         call = {'name': 'Read', 'arguments': {'file_path': 'x'}}
         mock = AsyncMock(side_effect=[upstream(json.dumps({'tool_calls': [call, call]})), upstream(json.dumps(call))])

@@ -54,18 +54,30 @@ PowerShell launchers are in [`scripts/`](scripts/) and include Lemonade-specific
 startup logic. The Claude Code launcher replaces the default system prompt with
 a smaller prompt and selects Read, Write, Edit, and Bash.
 
+For models with native tool calls and reasoning output, use the OpenAI-compatible
+base `http://127.0.0.1:13306/native/v1` and the upstream model ID. Start the service
+with `LEMON_MODEL` set, then run `python scripts/configure_fcc.py --native` to
+register this route in FCC. FCC's reasoning policy must allow client requests.
+Qwen3 uses its recommended sampling defaults and canonical tool-history markup
+for RyzenAI compatibility. Shell calls are syntax-checked with `bash -n` when
+Bash is installed; invalid calls get one repair attempt. Output is buffered for
+validation, including reasoning, so this path does not stream tokens as generated.
+
 ## Test results
 
 Integration fixture: read an input file, write an output, edit it, read it back,
 then check the final answer against the file. Backend: Qwen2.5-Coder-7B-Instruct-Hybrid
 on Lemonade/RyzenAI. Snapshot: 2026-10-20.
+The native regression uses Qwen3-4B-Hybrid with thinking enabled and locates a
+source file beneath a directory whose name contains spaces.
 
 | Check | Result |
 | --- | --- |
-| Unit and HTTP suite | 35 passed |
+| Unit and HTTP suite | 50 passed |
 | Pi → adapter → backend | Passed, 33.4 s summed API time |
 | Claude Code → adapter → backend | Passed, 168 s wall time including failure/recovery |
 | Pi → FCC → adapter → backend | Passed, 33.3 s summed API time |
+| Qwen3-4B native thinking: directory search | Passed |
 | Local translation and validation | 1.79 ms/request |
 
 Processing overhead is the median of three runs of 1,000 iterations with Pi's

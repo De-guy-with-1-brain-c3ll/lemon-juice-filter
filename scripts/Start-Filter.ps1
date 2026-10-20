@@ -8,6 +8,10 @@ function Read-LocalJson([string]$Uri) {
 }
 
 $ready = Read-LocalJson 'http://127.0.0.1:13306/health'
+$expectedModel = if ($env:LEMON_MODEL) { $env:LEMON_MODEL } else { 'Qwen2.5-Coder-7B-Instruct-Hybrid' }
+if ($ready -and $ready.upstream_model -ne $expectedModel) {
+    throw 'The adapter is running with another upstream model. Restart it with the requested LEMON_MODEL.'
+}
 if (Get-Process flm -ErrorAction SilentlyContinue) {
     throw 'FLM is still running. Stop its server to free the NPU before using the Lemonade hybrid model.'
 }

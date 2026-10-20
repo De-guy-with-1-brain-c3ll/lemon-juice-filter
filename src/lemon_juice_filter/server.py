@@ -11,7 +11,8 @@ import httpx
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
-from .protocol import ProtocolError, normalize_request, parse_decision, tool_prompt
+from .protocol import ProtocolError, normalize_request, parse_decision, schema_for_prompt, tool_prompt
+from .native import generate_native
 
 log = logging.getLogger('lemon_juice_filter')
 MODEL = 'lemon-hybrid'
@@ -65,9 +66,12 @@ async def models():
         'has_more': False, 'first_id': MODEL, 'last_id': MODEL}
 
 
-async def post_generation(payload):
+async def post_generation(payload, read_timeout=None):
     """Recover the observed RyzenAI lost-weights fault once, under the generation gate."""
-    response = await app.state.client.post(UPSTREAM_BASE + '/chat/completions', json=payload)
+    options = {'json': payload}
+    if read_timeout is not None:
+        options['timeout'] = httpx.Timeout(read_timeout, connect=5)
+    response = await app.state.client.post(UPSTREAM_BASE + '/chat/completions', **options)
     if (response.status_code == 500
             and 'Weights not loaded in MatMulNBits' in response.text
             and os.getenv('LEMON_AUTO_RECOVER_WEIGHTS', '1') == '1'
@@ -80,7 +84,7 @@ async def post_generation(payload):
                 ('load', {'model_name': UPSTREAM_MODEL, 'ctx_size': CONTEXT})):
             lifecycle = await app.state.client.post(UPSTREAM_BASE + '/' + endpoint, json=options)
             lifecycle.raise_for_status()
-        response = await app.state.client.post(UPSTREAM_BASE + '/chat/completions', json=payload)
+        response = await app.state.client.post(UPSTREAM_BASE + '/chat/completions', **options)
     response.raise_for_status()
     return response
 
@@ -104,7 +108,7 @@ async def generate(body, wire):
         transcript[-1]['content'].startswith(prefix) for prefix in ('{"tool_result":', '{"tool_results":')))
     if tools and not last_is_result:
         upstream_messages.append({'role': 'user', 'content':
-            'Continue the pending task above. Choose only the NEXT tool action if an operation remains. '
+            'Respond to the latest user request above. If work remains, call one of the declared tools. '
             'Wait for its actual tool_result before continuing. Output ONLY one JSON tool_calls decision, '
             'or a JSON object with exactly the key "final" containing the ACTUAL answer when the task is complete. '
             'If the tool_result already contains what the user asked to see, answer from that data now. '
@@ -138,14 +142,19 @@ async def generate(body, wire):
             except ProtocolError as exc:
                 if attempt:
                     raise ProtocolError('Model returned invalid tool output after one repair: ' + str(exc)) from exc
+                # Repeating the malformed answer taught this model to copy its
+                # invented next_action/directory_path envelope on the repair.
+                pending = next((m['content'] for m in reversed(transcript)
+                    if m['role'] == 'user' and not m['content'].startswith('{"tool_result":')), '')
+                catalog = [{'name': t.name, 'arguments_schema': schema_for_prompt(t.schema)} for t in tools]
                 payload['messages'] = upstream_messages + [
-                    {'role': 'assistant', 'content': raw},
                     {'role': 'user', 'content': 'Protocol correction: ' + str(exc) +
                      ' Return one complete JSON decision. If the real tool results already answer the user, '
                      'return exactly one top-level key "final" whose string value is that answer, with no "tool_calls" key. '
                      'Only use tool_calls when another real operation is needed, with an exact declared name '
                      'and arguments matching its schema. Do not invent completion tools or run a command '
-                     'merely to announce completion. Do not execute anything yourself.'}]
+                     'merely to announce completion. Do not execute anything yourself. '
+                     'Latest user request: ' + pending + '\nTool call schemas: ' + json.dumps(catalog, ensure_ascii=False)}]
     usage = data.get('usage') or {}
     app.state.completed += 1
     log.info('completed request=%s wire=%s tools=%s repairs=%d seconds=%.2f',
@@ -253,6 +262,41 @@ async def messages(request: Request):
 @app.post('/v1/chat/completions')
 async def completions(request: Request):
     return await handle(await request.json(), 'openai')
+
+
+@app.get('/native/v1/models')
+async def native_models():
+    return {'object': 'list', 'data': [{'id': UPSTREAM_MODEL, 'object': 'model',
+        'context_length': CONTEXT, 'supportsReasoning': True}]}
+
+
+@app.post('/native/v1/chat/completions')
+async def native_completions(request: Request):
+    body = await request.json()
+    if not body.get('stream'):
+        try:
+            return JSONResponse(await generate_native(body, app, post_generation, UPSTREAM_MODEL))
+        except httpx.HTTPError:
+            return JSONResponse({'error': {'message': 'Lemonade inference failed.'}}, status_code=502)
+
+    async def events():
+        task = asyncio.create_task(generate_native(body, app, post_generation, UPSTREAM_MODEL))
+        try:
+            while not task.done():
+                done, _ = await asyncio.wait({task}, timeout=10)
+                if not done:
+                    yield ': ping\n\n'
+            for event in openai_events(task.result()):
+                yield event
+        except (ProtocolError, httpx.HTTPError, ValueError, KeyError) as exc:
+            yield sse({'error': {'type': 'api_error', 'message': str(exc) if isinstance(exc, ProtocolError)
+                else 'Native inference failed.'}})
+        finally:
+            if not task.done():
+                task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await task
+    return StreamingResponse(events(), media_type='text/event-stream')
 
 
 @app.post('/v1/messages/count_tokens')
