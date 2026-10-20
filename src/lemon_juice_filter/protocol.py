@@ -185,6 +185,19 @@ def parse_decision(text: str, tools: list[Tool], choice: Any = None, parallel: b
     if not parallel and len(entries) > 1:
         raise ProtocolError('Only one tool call is allowed per response.')
     declared = {t.name: t for t in tools}
+    # Observed hybrid completion convention: this is answer text, never a tool
+    # to execute. A real client-declared tool of the same name takes precedence.
+    if len(entries) == 1 and isinstance(entries[0], dict):
+        final_fn = entries[0].get('function', entries[0])
+        if isinstance(final_fn, dict) and final_fn.get('name') == 'Final Answer' and 'Final Answer' not in declared:
+            final_args = final_fn.get('arguments')
+            if isinstance(final_args, str):
+                try:
+                    final_args = json.loads(final_args)
+                except json.JSONDecodeError:
+                    final_args = None
+            if isinstance(final_args, dict) and set(final_args) == {'answer'} and isinstance(final_args['answer'], str):
+                return _validate_choice(Decision(text=final_args['answer']), choice)
     calls = []
     for entry in entries:
         if not isinstance(entry, dict):

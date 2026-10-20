@@ -40,3 +40,12 @@ Official references:
 FCC can consume an OpenAI-compatible upstream. An assistant tool response must carry `message.tool_calls` with a function name and JSON-encoded arguments, `finish_reason: tool_calls`, and stable IDs. Its streaming form requires indexed `delta.tool_calls`, a terminal finish reason, and `[DONE]`. FCC then translates it to Anthropic for Pi/Claude Code.
 
 The adapter will expose both native Anthropic and OpenAI-compatible endpoints. It will never execute tools: the calling agent retains execution and permission handling. Invalid, undeclared, or schema-mismatched calls must fail closed, with at most one model repair attempt.
+
+## Observed completion convention
+
+In a real Claude Code fixture, the model successfully consumed tool results but
+finished with `{"tool_calls":[{"name":"Final Answer","arguments":{"answer":"result=43"}}]}`.
+The adapter treats this exact one-call, answer-only form as ordinary final text,
+unless the client actually declared a tool named `Final Answer`. Extra operational
+arguments are rejected. Required-tool choices still reject a final answer. No
+model-supplied ID is trusted or used for tool execution.

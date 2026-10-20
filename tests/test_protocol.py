@@ -60,6 +60,24 @@ class ProtocolTests(unittest.TestCase):
         with self.assertRaises(ProtocolError):
             parse_decision('{"name":"read","arguments":{"path":"x"}}', [READ], 'none')
 
+    def test_observed_final_answer_pseudo_tool_is_plain_text(self):
+        raw = '{"tool_calls":[{"name":"Final Answer","arguments":{"answer":"result=43"}}]}'
+        decision = parse_decision(raw, [READ], require_envelope=True)
+        self.assertEqual(decision.text, 'result=43')
+        self.assertFalse(decision.calls)
+        with self.assertRaises(ProtocolError):
+            parse_decision(raw, [READ], 'required')
+
+    def test_final_answer_cannot_hide_operational_arguments(self):
+        with self.assertRaises(ProtocolError):
+            parse_decision('{"name":"Final Answer","arguments":{"answer":"done","command":"anything"}}', [READ])
+
+    def test_real_declared_final_answer_tool_is_not_rewritten(self):
+        final_tool = Tool('Final Answer', '', {'type': 'object', 'properties': {'answer': {'type': 'string'}}, 'required': ['answer']})
+        decision = parse_decision('{"name":"Final Answer","arguments":{"answer":"done"}}', [final_tool])
+        self.assertEqual(decision.calls[0].name, 'Final Answer')
+        self.assertEqual(decision.text, '')
+
     def test_anthropic_result_history_preserves_error_and_id(self):
         body = {'messages': [{'role': 'assistant', 'content': [{'type': 'tool_use', 'id': 'one', 'name': 'Read', 'input': {'file_path': 'x'}}]},
             {'role': 'user', 'content': [{'type': 'tool_result', 'tool_use_id': 'one', 'content': 'missing', 'is_error': True}]}]}
