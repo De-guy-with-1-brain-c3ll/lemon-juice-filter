@@ -9,6 +9,29 @@ CLAUDE = Tool('Read', '', {'type': 'object', 'properties': {'file_path': {'type'
 
 
 class ProtocolTests(unittest.TestCase):
+    def test_observed_shell_space_escape_is_preserved(self):
+        shell = Tool('Bash', '', {'type': 'object', 'properties': {'command': {'type': 'string'}}, 'required': ['command']})
+        raw = r'<tool_call>{"name":"Bash","arguments":{"command":"ls -R ./Desktop/VSCODE\ projects"}}</tool_call>'
+        result = parse_decision(raw, [shell])
+        self.assertEqual(result.calls[0].arguments['command'], r'ls -R ./Desktop/VSCODE\ projects')
+
+    def test_native_argument_string_accepts_only_lossless_escape_correction(self):
+        shell = Tool('Bash', '', {'type': 'object', 'properties': {'command': {'type': 'string'}}, 'required': ['command']})
+        raw = json.dumps({'tool_calls': [{'function': {'name': 'Bash',
+            'arguments': r'{"command":"ls VSCODE\ projects"}'}}]})
+        self.assertEqual(parse_decision(raw, [shell]).calls[0].arguments['command'], r'ls VSCODE\ projects')
+
+    def test_escape_correction_preserves_valid_escaped_quotes_and_newlines(self):
+        raw = r'{"name":"read","arguments":{"path":"VSCODE\ projects\\file\"name\n.txt"}}'
+        result = parse_decision(raw, [READ])
+        self.assertEqual(result.calls[0].arguments['path'], 'VSCODE\\ projects\\file"name\n.txt')
+
+    def test_escape_correction_does_not_complete_truncated_objects_or_unicode(self):
+        for raw in (r'{"name":"read","arguments":{"path":"VSCODE\ projects"',
+                    r'{"name":"read","arguments":{"path":"C:\user"}}'):
+            with self.assertRaises(ProtocolError):
+                parse_decision(raw, [READ])
+
     def test_tool_inventory_precedes_protocol_and_uses_client_names(self):
         prompt = tool_prompt([READ, CLAUDE])
         inventory = prompt.split('TOOL PROTOCOL:', 1)[0]

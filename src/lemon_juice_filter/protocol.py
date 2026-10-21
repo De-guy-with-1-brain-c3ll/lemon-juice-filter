@@ -214,10 +214,35 @@ def _unwrap(text: str) -> str:
     return text
 
 
+def decode_model_json(raw: str):
+    """Preserve literal backslashes where a model emits an invalid JSON escape."""
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError as exc:
+        if not exc.msg.startswith('Invalid \\escape'):
+            raise
+    result, in_string, index = [], False, 0
+    while index < len(raw):
+        char = raw[index]
+        if in_string and char == '\\' and index + 1 < len(raw):
+            following = raw[index + 1]
+            if following in '"\\/bfnrtu':
+                result.extend((char, following))
+                index += 2
+                continue
+            result.extend(('\\', '\\'))
+        else:
+            result.append(char)
+            if char == '"':
+                in_string = not in_string
+        index += 1
+    return json.loads(''.join(result))
+
+
 def parse_decision(text: str, tools: list[Tool], choice: Any = None, parallel: bool = True, require_envelope: bool = False) -> Decision:
     raw = _unwrap(text)
     try:
-        obj = json.loads(raw)
+        obj = decode_model_json(raw)
     except json.JSONDecodeError as exc:
         if raw.startswith(('{', '[', '<tool_call>', '<response>')) and re.search(r'"(?:tool_calls|tool_call|arguments)"|<tool_call>|<response>', raw):
             raise ProtocolError('Malformed tool-call JSON; return a complete object.') from exc
@@ -273,7 +298,7 @@ def parse_decision(text: str, tools: list[Tool], choice: Any = None, parallel: b
         args = fn.get('arguments', fn.get('input'))
         if isinstance(args, str):
             try:
-                args = json.loads(args)
+                args = decode_model_json(args)
             except json.JSONDecodeError as exc:
                 raise ProtocolError(f'Invalid argument JSON for {name}.') from exc
         if not isinstance(args, dict):
