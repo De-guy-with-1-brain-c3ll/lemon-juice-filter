@@ -6,13 +6,13 @@ function Read-LocalJson([string]$Uri) {
 }
 $health = Read-LocalJson 'http://127.0.0.1:13306/health'
 $config = Read-LocalJson 'http://127.0.0.1:8082/admin/api/config'
-$thinking = $env:LEMON_CLAUDE_THINKING -ne '0'
+$thinking = $env:LEMON_CLAUDE_THINKING -eq '1'
 $baseUrl = if ($thinking) { 'http://127.0.0.1:13306/native/v1' } else { 'http://127.0.0.1:13306/native/no-thinking/v1' }
 $provider = $config.custom_providers | Where-Object {
     $_.base_url.TrimEnd('/') -eq $baseUrl -and
     $_.model_ids -contains $health.upstream_model
 } | Select-Object -First 1
-if (-not $provider) { throw 'Register the selected native endpoint with scripts/configure_fcc.py --native (add --no-thinking when LEMON_CLAUDE_THINKING=0).' }
+if (-not $provider) { throw 'Register the selected native endpoint with scripts/configure_fcc.py --native (add --no-thinking for the default profile).' }
 $model = $provider.provider_id + '/' + $health.upstream_model
 $cwd = (Get-Location).Path.Replace('\', '/')
 $platform = if ($env:OS -eq 'Windows_NT') {

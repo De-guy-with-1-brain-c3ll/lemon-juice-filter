@@ -75,7 +75,9 @@ stream tokens as generated.
 `scripts/configure_fcc.py --native --no-thinking` registers the route that
 disables thinking. RyzenAI 1.7 ignores `chat_template_kwargs`, so the adapter
 also appends Qwen's `/no_think` soft switch. `scripts/claude-native.ps1`
-selects the route from `LEMON_CLAUDE_THINKING` (`0` disables thinking).
+defaults to the no-thinking route; set `LEMON_CLAUDE_THINKING=1` to select the
+thinking route. Thinking is slower and, with small hybrid models, more likely to
+answer from assumptions instead of reading the files it was asked to verify.
 
 ## Verification
 
