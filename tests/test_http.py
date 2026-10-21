@@ -5,7 +5,7 @@ from unittest.mock import AsyncMock
 import httpx
 from fastapi.testclient import TestClient
 
-from lemon_juice_filter.server import app
+from lemon_juice_filter.server import app, CONTEXT, UPSTREAM_MODEL
 
 
 def upstream(text):
@@ -120,8 +120,8 @@ class HttpTests(unittest.TestCase):
         self.assertEqual(self.client.post('/v1/messages', json=self.body).status_code, 200)
         calls = mock.call_args_list
         self.assertTrue(calls[1].args[0].endswith('/unload'))
-        self.assertEqual(calls[1].kwargs['json'], {'model_name': 'Qwen2.5-Coder-7B-Instruct-Hybrid'})
-        self.assertEqual(calls[2].kwargs['json']['ctx_size'], 32768)
+        self.assertEqual(calls[1].kwargs['json'], {'model_name': UPSTREAM_MODEL})
+        self.assertEqual(calls[2].kwargs['json']['ctx_size'], CONTEXT)
         self.assertEqual(calls[3].kwargs, calls[0].kwargs)
         self.assertEqual(calls[3].args, calls[0].args)
 

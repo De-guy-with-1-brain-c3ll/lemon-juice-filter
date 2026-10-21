@@ -4,7 +4,11 @@ $runtime = Join-Path $repo 'runtime'
 New-Item -ItemType Directory -Path $runtime -Force | Out-Null
 
 function Read-LocalJson([string]$Uri) {
-    try { return Invoke-RestMethod -Uri $Uri -TimeoutSec 3 -NoProxy } catch { return $null }
+    try {
+        $json = & curl.exe -s --noproxy '*' --max-time 3 $Uri
+        if ($LASTEXITCODE -ne 0 -or -not $json) { return $null }
+        return $json | ConvertFrom-Json
+    } catch { return $null }
 }
 
 $ready = Read-LocalJson 'http://127.0.0.1:13306/health'
@@ -25,6 +29,20 @@ $lemonDeadline = (Get-Date).AddSeconds(30)
 while (-not (Read-LocalJson 'http://127.0.0.1:13305/api/v1/health')) {
     if ((Get-Date) -gt $lemonDeadline) { throw 'Lemonade did not become ready on port 13305.' }
     Start-Sleep -Seconds 1
+}
+$lemonHealth = Read-LocalJson 'http://127.0.0.1:13305/api/v1/health'
+$loaded = $lemonHealth.all_models_loaded | Where-Object { $_.model_name -eq $expectedModel } | Select-Object -First 1
+if ($loaded.recipe -eq 'ryzenai-llm') {
+    $backend = [Uri]$loaded.backend_url
+    if (-not $backend.IsLoopback -or $backend.Scheme -ne 'http') { throw 'Expected a loopback RyzenAI backend.' }
+    $backendHealth = Read-LocalJson ($backend.GetLeftPart([UriPartial]::Authority) + '/health')
+    if (-not $backendHealth.max_prompt_length) { throw 'Cannot verify the RyzenAI prompt limit.' }
+    if ($backendHealth.max_prompt_length -lt 4096) {
+        throw 'RyzenAI is limited to fewer than 4096 prompt tokens and silently truncates agent context. Configure the model with scripts/configure_ryzenai_context.py, reload it, and retry.'
+    }
+    $configuredContext = if ($env:LEMON_CONTEXT_WINDOW) { [int]$env:LEMON_CONTEXT_WINDOW } else { 32768 }
+    $env:LEMON_CONTEXT_WINDOW = [string][Math]::Min($configuredContext, [int]$backendHealth.max_prompt_length)
+    if ($ready -and $ready.context_window -ne [int]$env:LEMON_CONTEXT_WINDOW) { throw 'Restart the adapter to apply the verified backend context window.' }
 }
 if ($ready -and $ready.model -eq 'lemon-hybrid') { return }
 

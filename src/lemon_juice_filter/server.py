@@ -18,7 +18,7 @@ log = logging.getLogger('lemon_juice_filter')
 MODEL = 'lemon-hybrid'
 UPSTREAM_MODEL = os.getenv('LEMON_MODEL', 'Qwen2.5-Coder-7B-Instruct-Hybrid')
 UPSTREAM_BASE = os.getenv('LEMON_BASE_URL', 'http://127.0.0.1:13305/api/v1').rstrip('/')
-CONTEXT = 32768
+CONTEXT = int(os.getenv('LEMON_CONTEXT_WINDOW', '32768'))
 MAX_OUTPUT = 4096
 
 
@@ -28,6 +28,7 @@ async def lifespan(app):
         app.state.client = client
         app.state.gate = asyncio.Semaphore(1)
         app.state.completed = 0
+        app.state.context_window = CONTEXT
         app.state.last_weight_recovery = float('-inf')
         yield
 
@@ -273,6 +274,27 @@ async def native_models():
 @app.post('/native/v1/chat/completions')
 async def native_completions(request: Request):
     body = await request.json()
+    return await handle_native(body)
+
+
+@app.get('/native/no-thinking/v1/models')
+async def native_fast_models():
+    result = await native_models()
+    result['data'][0]['supportsReasoning'] = False
+    return result
+
+
+@app.post('/native/no-thinking/v1/chat/completions')
+async def native_fast_completions(request: Request):
+    body = await request.json()
+    kwargs = body.get('chat_template_kwargs', {})
+    if not isinstance(kwargs, dict):
+        raise ProtocolError('chat_template_kwargs must be an object.')
+    body['chat_template_kwargs'] = {**kwargs, 'enable_thinking': False}
+    return await handle_native(body)
+
+
+async def handle_native(body):
     if not body.get('stream'):
         try:
             return JSONResponse(await generate_native(body, app, post_generation, UPSTREAM_MODEL))
