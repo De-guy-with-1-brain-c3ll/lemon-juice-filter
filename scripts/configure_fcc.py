@@ -17,15 +17,21 @@ def call(path, body=None):
 
 parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument('--native', action='store_true', help='Preserve native thinking and structured tool calls')
+parser.add_argument('--no-thinking', action='store_true', help='Use the native endpoint that explicitly disables thinking')
 args = parser.parse_args()
+if args.no_thinking and not args.native:
+    parser.error('--no-thinking requires --native')
 config = call('/admin/api/config')
 display_name = 'Lemon Juice Filter Native' if args.native else 'Lemon Juice Filter'
+if args.no_thinking:
+    display_name += ' (no thinking)'
 model_id = 'lemon-hybrid'
 if args.native:
     with opener.open('http://127.0.0.1:13306/health', timeout=5) as response:
         model_id = json.load(response)['upstream_model']
 existing = next((p for p in config['custom_providers'] if p['display_name'] == display_name), None)
-values = {'display_name': display_name, 'base_url': 'http://127.0.0.1:13306/' + ('native/v1' if args.native else 'v1'),
+route = 'native/no-thinking/v1' if args.no_thinking else ('native/v1' if args.native else 'v1')
+values = {'display_name': display_name, 'base_url': 'http://127.0.0.1:13306/' + route,
     'api_format': 'openai_chat', 'reasoning_format': 'chat_template' if args.native else 'provider_default',
     'reasoning_history_format': 'disabled', 'model_ids': [model_id]}
 mutation = {'action': 'update' if existing else 'create', 'values': values}
@@ -41,6 +47,7 @@ if provider is None:
 ref = provider['provider_id'] + '/' + model_id
 runtime = Path(__file__).resolve().parents[1] / 'runtime'
 runtime.mkdir(exist_ok=True)
-(runtime / ('fcc-native-provider.json' if args.native else 'fcc-provider.json')).write_text(json.dumps({'model': ref}, indent=2) + '\n')
+filename = 'fcc-native-fast-provider.json' if args.no_thinking else ('fcc-native-provider.json' if args.native else 'fcc-provider.json')
+(runtime / filename).write_text(json.dumps({'model': ref}, indent=2) + '\n')
 print('FCC model registered:', ref)
 print('Global default model was not changed.')

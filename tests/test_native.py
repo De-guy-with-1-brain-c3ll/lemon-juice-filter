@@ -8,7 +8,7 @@ from unittest.mock import AsyncMock, patch
 import httpx
 from fastapi.testclient import TestClient
 from lemon_juice_filter.server import app
-from lemon_juice_filter.native import unresolved_failures
+from lemon_juice_filter.native import promises_action, unresolved_failures
 
 
 def response(command=None, text=None):
@@ -59,10 +59,8 @@ class NativeTests(unittest.TestCase):
         self.assertEqual(assistant['content'].count('<tool_call>'), 1)
         self.assertNotIn('tool_calls', assistant)
         observation = next(m for m in reversed(sent) if m['content'].startswith('<tool_response>'))
-        result = json.loads(observation['content'].removeprefix('<tool_response>\n').removesuffix('\n</tool_response>'))
-        self.assertEqual(result, {'tool_call_id': 'fixture', 'name': 'bash', 'output': 'file.txt'})
-        self.assertEqual(sent[-1]['role'], 'system')
-        self.assertIn('not user input', sent[-1]['content'])
+        self.assertEqual(observation['content'], '<tool_response>\nfile.txt\n</tool_response>')
+        self.assertEqual(sent[-1], observation)
 
     def test_followup_preserves_failed_call_and_all_user_turns(self):
         historical = response('ls /missing').json()['choices'][0]['message']
@@ -75,14 +73,11 @@ class NativeTests(unittest.TestCase):
         r = self.client.post('/native/v1/chat/completions', json={**self.body, 'messages': messages})
         self.assertEqual(r.status_code, 200)
         sent = app.state.client.post.call_args.kwargs['json']['messages']
-        self.assertEqual(sent[1]['content'], 'Remember folder alpha.')
-        self.assertEqual(sent[3]['content'], 'Inspect that folder.')
-        self.assertNotIn('reasoning_content', sent[2])
+        self.assertEqual(sent[0]['content'], 'Remember folder alpha.')
+        self.assertEqual(sent[2]['content'], 'Inspect that folder.')
+        self.assertNotIn('reasoning_content', sent[1])
         observation = next(m for m in reversed(sent) if m['content'].startswith('<tool_response>'))
-        result = json.loads(observation['content'][len('<tool_response>\n'):-len('\n</tool_response>')])
-        self.assertEqual(result['name'], 'bash')
-        self.assertTrue(result['is_error'])
-        self.assertEqual(result['output'], 'No such file or directory')
+        self.assertEqual(observation['content'], '<tool_response>\nTool execution failed:\nNo such file or directory\n</tool_response>')
         self.assertEqual(json.dumps(messages), original)
 
     def failed_history(self, **overrides):
@@ -203,3 +198,92 @@ class NativeTests(unittest.TestCase):
         self.assertEqual(self.client.post('/native/v1/chat/completions', json={**self.body, 'messages': messages}).status_code, 200)
         sent = app.state.client.post.call_args.kwargs['json']['messages']
         self.assertEqual(sent[-1], messages[-1])
+
+    def test_explicit_fast_route_disables_client_requested_thinking(self):
+        app.state.client.post = AsyncMock(return_value=response('ls'))
+        body = {**self.body, 'chat_template_kwargs': {'enable_thinking': True, 'custom_option': 7}}
+        r = self.client.post('/native/no-thinking/v1/chat/completions', json=body)
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(r.json()['choices'][0]['finish_reason'], 'tool_calls')
+        sent = app.state.client.post.call_args.kwargs['json']
+        self.assertEqual(sent['chat_template_kwargs'], {'enable_thinking': False, 'custom_option': 7})
+        self.assertEqual((sent['temperature'], sent['top_p']), (.7, .8))
+        self.assertEqual(sent['messages'][-1], {'role': 'system', 'content': '/no_think'})
+
+    def test_fast_route_streams_validated_calls(self):
+        app.state.client.post = AsyncMock(return_value=response('ls'))
+        r = self.client.post('/native/no-thinking/v1/chat/completions', json={**self.body, 'stream': True})
+        self.assertIn('"finish_reason": "tool_calls"', r.text)
+        self.assertIn('[DONE]', r.text)
+        self.assertFalse(app.state.client.post.call_args.kwargs['json']['chat_template_kwargs']['enable_thinking'])
+
+    def test_fast_route_advertises_no_reasoning_without_changing_native_route(self):
+        fast = self.client.get('/native/no-thinking/v1/models').json()['data'][0]
+        standard = self.client.get('/native/v1/models').json()['data'][0]
+        self.assertEqual(fast['id'], standard['id'])
+        self.assertFalse(fast['supportsReasoning'])
+        self.assertTrue(standard['supportsReasoning'])
+
+    def test_fast_route_rejects_malformed_template_options(self):
+        app.state.client.post = AsyncMock()
+        r = self.client.post('/native/no-thinking/v1/chat/completions', json={**self.body, 'chat_template_kwargs': []})
+        self.assertEqual(r.status_code, 400)
+        app.state.client.post.assert_not_called()
+
+    def test_detected_context_overflow_does_not_emit_a_call_or_attempt_repair(self):
+        data = response('ls').json()
+        data['usage'] = {'prompt_tokens': 2049}
+        app.state.context_window = 2048
+        app.state.client.post = AsyncMock(return_value=httpx.Response(200,
+            request=httpx.Request('POST', 'http://localhost'), json=data))
+        r = self.client.post('/native/v1/chat/completions', json=self.body)
+        self.assertEqual(r.status_code, 400)
+        self.assertIn('exceeding the verified 2048-token window', r.text)
+        self.assertNotIn('"tool_calls"', r.text)
+        self.assertEqual(app.state.client.post.call_count, 1)
+
+    def test_claude_shell_exit_status_remains_a_failure_after_fcc_conversion(self):
+        messages = self.failed_history()['messages']
+        messages[-1]['content'] = 'Exit code 2\nls: cannot access missing: No such file or directory'
+        self.assertEqual(unresolved_failures(messages), {'bash'})
+        messages[-1]['content'] = 'Exit code 0\nfile.txt'
+        self.assertEqual(unresolved_failures(messages), set())
+
+    def test_compact_native_manual_preserves_constraints_and_client_request(self):
+        body = {**self.body, 'tools': [{'type': 'function', 'function': {'name': 'bash',
+            'description': 'Execute a shell command.\n\n' + 'Long workflow instructions. ' * 100,
+            'parameters': {'type': 'object', 'properties': {'command': {'type': 'string',
+                'description': 'Shell input. ' * 100, 'enum': ['pwd']}}, 'required': ['command']}}}]}
+        original = json.dumps(body)
+        app.state.client.post = AsyncMock(side_effect=[response('ls'), response('pwd')])
+        result = self.client.post('/native/v1/chat/completions', json=body)
+        self.assertEqual(result.status_code, 200)
+        self.assertEqual(app.state.client.post.call_count, 2)
+        sent = app.state.client.post.call_args.kwargs['json']['tools'][0]['function']
+        self.assertEqual(sent['description'], 'Execute a shell command.')
+        self.assertEqual(sent['parameters']['properties']['command']['enum'], ['pwd'])
+        self.assertLessEqual(len(sent['parameters']['properties']['command']['description']), 160)
+        self.assertEqual(json.dumps(body), original)
+
+    def test_announced_action_is_retried_once_without_being_returned(self):
+        app.state.client.post = AsyncMock(side_effect=[
+            response(text='To verify it, I will read the file. Let me proceed with that.'),
+            response('ls')])
+        r = self.client.post('/native/v1/chat/completions', json=self.body)
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(r.json()['choices'][0]['finish_reason'], 'tool_calls')
+        self.assertEqual(app.state.client.post.call_count, 2)
+        self.assertIn('announced an action', app.state.client.post.call_args.kwargs['json']['messages'][-1]['content'])
+
+    def test_ordinary_answer_is_not_retried(self):
+        app.state.client.post = AsyncMock(return_value=response(text='There are three files here.'))
+        r = self.client.post('/native/v1/chat/completions', json=self.body)
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(app.state.client.post.call_count, 1)
+        self.assertEqual(promises_action('There are three files here.'), False)
+        self.assertTrue(promises_action('Next, I will inspect the src folder.'))
+
+    def test_fast_greeting_does_not_need_a_completion_review(self):
+        app.state.client.post = AsyncMock(return_value=response(text='Hello.'))
+        self.assertEqual(self.client.post('/native/no-thinking/v1/chat/completions', json=self.body).status_code, 200)
+        self.assertEqual(app.state.client.post.call_count, 1)

@@ -7,7 +7,18 @@ import re
 from pathlib import Path
 import shutil
 
-from .protocol import ProtocolError, normalize_request, parse_decision, text_content
+from .protocol import ProtocolError, normalize_request, parse_decision, schema_for_prompt, text_content
+
+
+_PROMISED_ACTION = re.compile(
+    r"(?i)\b(?:i(?:'ll| will| am going to| need to)|let me|next,? i(?:'ll| will)|i'm going to)\b"
+    r"[^.\n]{0,120}?\b(?:read|open|inspect|check|list|run|execute|look|verify|search|find|"
+    r"create|write|edit|update|use|call|query)\b")
+
+
+def promises_action(text):
+    """True when the model narrated a next step instead of performing it."""
+    return bool(text) and bool(_PROMISED_ACTION.search(text))
 
 
 def unresolved_failures(messages):
@@ -21,8 +32,8 @@ def unresolved_failures(messages):
         if message['role'] != 'tool':
             continue
         name = names[message['tool_call_id']]
-        failed = message.get('is_error') is True or bool(re.search(
-            r'(?m)^Command exited with code [1-9][0-9]*\s*$', text_content(message.get('content'))))
+        failed = message.get('is_error') is True or (name in ('bash', 'Bash') and bool(re.search(
+            r'(?m)^(?:Command exited with code |Exit code )[1-9][0-9]*\s*$', text_content(message.get('content')))))
         if failed:
             pending.add(name)
         else:
@@ -91,15 +102,10 @@ async def generate_native(body, app, post_generation, upstream_model):
                         'arguments': arguments}, ensure_ascii=False) + '\n</tool_call>')
                 message['content'] = '\n'.join(rendered)
         if message['role'] == 'tool' and upstream_model.startswith('Qwen3-'):
-            # Retain provenance when converting a native tool turn to Qwen's
-            # user-role template. In particular, errors must not become plain
-            # user instructions or lose their association with the failed call.
-            result = {'tool_call_id': message['tool_call_id'],
-                'name': call_names[message['tool_call_id']],
-                'output': text_content(message['content'])}
-            if 'is_error' in message:
-                result['is_error'] = message['is_error']
-            message = {'role': 'user', 'content': '<tool_response>\n' + json.dumps(result, ensure_ascii=False) + '\n</tool_response>'}
+            output = text_content(message['content'])
+            if message.get('is_error') is True:
+                output = 'Tool execution failed:\n' + output
+            message = {'role': 'user', 'content': '<tool_response>\n' + output + '\n</tool_response>'}
         messages.append(message)
     payload = {k: v for k, v in body.items() if k in (
         'tools', 'tool_choice', 'parallel_tool_calls', 'temperature', 'top_p', 'top_k',
@@ -107,48 +113,25 @@ async def generate_native(body, app, post_generation, upstream_model):
     payload.update(model=upstream_model, messages=messages, stream=False,
                    max_tokens=min(limit, 4096), parallel_tool_calls=False)
     if upstream_model.startswith('Qwen3-'):
-        guidance = ('You are an agent carrying out the latest user request using the available tools. '
-            'The declared tools are callable programs connected to the user environment. '
-            'Your tool calls execute there; <tool_response> contains observations from those calls, '
-            'not a message or terminal output supplied by the user. Use observations as evidence '
-            'to choose the next action and answer the actual request. Never infer file contents '
-            'or properties such as encryption from a filename alone. '
-            'When asked to inspect, locate, read, or modify something, perform the operation with '
-            'tools within the existing permissions instead of giving the user steps to perform it. '
-            'Answer greetings and questions that need no tools directly. '
-            'Use concise reasoning and one tool action at a time. When choosing shell commands, '
-            'prefer simple commands and quote entire paths containing spaces. Inspect directory structure '
-            'before filtering by filename or assuming a programming language. Use the environment and '
-            'working directory supplied by the client; do not assume WSL or invent mount points. '
-            'If a path does not exist, inspect the current directory, home directory, or parent directory '
-            'with a tool and use the observed paths. A failed tool call does not finish the task. '
-            'After an error, make a corrected call or a diagnostic call before answering, when a safe '
-            'alternative is available. Do not merely suggest a command the user already asked you to run '
-            'or ask permission again for the same task. Do not repeat an identical failed call. '
-            'Respect user restrictions and tool permissions. If diagnostics establish a blocker or '
-            'recovery attempts keep failing, report the blocker without claiming success. '
-            'Once tool results answer the user, give the answer without another tool call.')
-        if messages and messages[0]['role'] == 'system':
-            messages[0]['content'] = text_content(messages[0]['content']) + '\n\n' + guidance
-        else:
-            messages.insert(0, {'role': 'system', 'content': guidance})
+        # CLI tool manuals contain lengthy workflow prose. Retain the full
+        # validation schema locally while shortening model-facing annotations.
+        payload['tools'] = [{**tool, 'function': {**tool['function'],
+            'description': tool['function'].get('description', '').split('\n\n', 1)[0][:320],
+            'parameters': schema_for_prompt(tool['function'].get('parameters', {'type': 'object'}))}}
+            for tool in body.get('tools') or []]
         thinking = payload.get('chat_template_kwargs', {}).get('enable_thinking', True)
         payload.setdefault('temperature', 0.6 if thinking else 0.7)
         payload.setdefault('top_p', 0.95 if thinking else 0.8)
         payload.setdefault('top_k', 20)
         payload.setdefault('min_p', 0)
-        if body.get('messages') and body['messages'][-1]['role'] == 'tool':
-            # Keep the true user request as the template's last_query_index.
-            # A system continuation cue distinguishes an observation from a
-            # fresh request without turning adapter instructions into user turns.
-            messages.append({'role': 'system', 'content':
-                'The preceding tool response is the result of your own action, not user input. '
-                'Continue the latest user request using that observation. If more inspection is '
-                'needed, call a tool. If the request is complete, answer using only verified facts. '
-                'Follow the existing user restrictions and permissions.'})
+        if not thinking:
+            # RyzenAI 1.7 ignores chat_template_kwargs. Qwen's supported soft
+            # switch must also be present in the rendered conversation.
+            messages.append({'role': 'system', 'content': '/no_think'})
     if os.getenv('LEMON_NATIVE_DEBUG') == '1':
-        logging.getLogger('lemon_juice_filter').info('native request options=%s message_shapes=%s',
+        logging.getLogger('lemon_juice_filter').info('native request options=%s tools=%s message_shapes=%s',
             {k: payload.get(k) for k in ('temperature', 'top_p', 'top_k', 'tool_choice', 'chat_template_kwargs')},
+            [tool.name for tool in tools],
             [(m['role'], type(m.get('content')).__name__, len(m.get('content') or ''),
               len(m.get('tool_calls', []))) for m in messages])
     async with app.state.gate:
@@ -157,6 +140,13 @@ async def generate_native(body, app, post_generation, upstream_model):
             # timeout. Keep a bound while allowing the declared token budget.
             response = await post_generation(payload, read_timeout=max(240, min(600, payload['max_tokens'] / 8 + 30)))
             data = response.json()
+            used = (data.get('usage') or {}).get('prompt_tokens')
+            window = getattr(app.state, 'context_window', None)
+            if os.getenv('LEMON_NATIVE_DEBUG') == '1':
+                logging.getLogger('lemon_juice_filter').info('native usage prompt_tokens=%s window=%s', used, window)
+            if isinstance(used, int) and window and used > window:
+                raise ProtocolError(f'Prompt uses {used} tokens, exceeding the verified {window}-token window. '
+                    'Compact the conversation before retrying; the backend may have discarded earlier instructions.')
             item = data['choices'][0]
             message = item['message']
             try:
@@ -177,6 +167,13 @@ async def generate_native(body, app, post_generation, upstream_model):
                     # A small model can treat the first failed command as the
                     # end of the task. Give it one bounded chance to recover;
                     # never force execution or suppress a genuine blocker.
+                    if not attempt and tools and body.get('tool_choice') != 'none' and promises_action(decision.text):
+                        # The model announced the next step instead of taking it.
+                        # One bounded retry; the client still controls the loop.
+                        payload['messages'] = messages + [{'role': 'system', 'content':
+                            'Your last reply announced an action but did not call a tool. '
+                            'Emit the tool call now with the exact arguments; do not describe or simulate it.'}]
+                        continue
                     if not attempt and tools and pending_failures and body.get('tool_choice') != 'none':
                         payload['messages'] = messages + [{'role': 'system', 'content':
                             'A tool failed and has not subsequently succeeded; the original task is still pending. '

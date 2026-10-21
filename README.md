@@ -34,18 +34,25 @@ Set `LEMON_MODEL` to the model ID exposed by the inference server and
 | `LEMON_MODEL` | `Qwen2.5-Coder-7B-Instruct-Hybrid` | Upstream model ID |
 | `LEMON_BASE_URL` | `http://127.0.0.1:13305/api/v1` | Upstream API base |
 | `LEMON_FILTER_PORT` | `13306` | Adapter port |
+| `LEMON_CONTEXT_WINDOW` | `32768` | Advertised context window; `scripts/Start-Filter.ps1` lowers it to the verified backend limit |
 | `LEMON_AUTO_RECOVER_WEIGHTS` | `1` | Recovery for a specific RyzenAI lost-weights fault; use `0` for other backends |
 
 The defaults target Lemonade. Other backends must provide an unauthenticated
 OpenAI-compatible `/chat/completions` endpoint; they have not been validated here.
 The client-facing model ID is currently `lemon-hybrid`, independent of the upstream
-ID. Advertised context and output limits are fixed at 32,768 and 4,096 tokens;
-changing the upstream model does not adjust them automatically.
+ID. The advertised context window comes from `LEMON_CONTEXT_WINDOW`; the output
+limit is 4,096 tokens. RyzenAI can silently cap prompts below the requested
+context, so `scripts/Start-Filter.ps1` reads the backend's `max_prompt_length`
+and lowers the advertised window to it. `scripts/configure_ryzenai_context.py`
+raises that limit for a hybrid model snapshot (with a backup) when it is below
+the value needed for agent use.
 
 | Client | API base | Model |
 | --- | --- | --- |
 | Pi / Claude Code | `http://127.0.0.1:13306` (Anthropic Messages) | `lemon-hybrid` |
 | FCC | `http://127.0.0.1:13306/v1` (OpenAI Chat Completions) | `lemon-hybrid` |
+| FCC, native | `http://127.0.0.1:13306/native/v1` (OpenAI Chat Completions) | upstream model ID |
+| FCC, native without thinking | `http://127.0.0.1:13306/native/no-thinking/v1` | upstream model ID |
 
 Use a placeholder API key if the client requires one. The adapter binds to loopback.
 
@@ -60,37 +67,33 @@ with `LEMON_MODEL` set, then run `python scripts/configure_fcc.py --native` to
 register this route in FCC. FCC's reasoning policy must allow client requests.
 Qwen3 uses its recommended sampling defaults and canonical tool-history markup
 for RyzenAI compatibility. Shell calls are syntax-checked with `bash -n` when
-Bash is installed; invalid calls get one repair attempt. Output is buffered for
-validation, including reasoning, so this path does not stream tokens as generated.
+Bash is installed; invalid calls get one repair attempt. A reply that announces
+an action without calling a tool gets one retry asking for the call itself.
+Output is buffered for validation, including reasoning, so this path does not
+stream tokens as generated.
 
-## Test results
+`scripts/configure_fcc.py --native --no-thinking` registers the route that
+disables thinking. RyzenAI 1.7 ignores `chat_template_kwargs`, so the adapter
+also appends Qwen's `/no_think` soft switch. `scripts/claude-native.ps1`
+selects the route from `LEMON_CLAUDE_THINKING` (`0` disables thinking).
 
-Integration fixture: read an input file, write an output, edit it, read it back,
-then check the final answer against the file. Backend: Qwen2.5-Coder-7B-Instruct-Hybrid
-on Lemonade/RyzenAI. Snapshot: 2026-10-20.
-The native regression uses Qwen3-4B-Hybrid with thinking enabled and locates a
-source file beneath a directory whose name contains spaces.
+## Verification
 
-| Check | Result |
-| --- | --- |
-| Unit and HTTP suite | 58 passed |
-| Pi → adapter → backend | Passed, 33.4 s summed API time |
-| Claude Code → adapter → backend | Passed, 168 s wall time including failure/recovery |
-| Pi → FCC → adapter → backend | Passed, 33.3 s summed API time |
-| Qwen3-4B native thinking: directory search | Passed |
-| Qwen3-4B native thinking: failed read recovery and user follow-up | Passed |
-| Local translation and validation | 1.79 ms/request |
-
-Processing overhead is the median of three runs of 1,000 iterations with Pi's
-read/write/edit schemas, excluding HTTP transport and inference. Integration
-timings are individual runs, not throughput benchmarks. Earlier runs failed on
-invalid arguments after repair; this model's completion rate remains uneven.
+The unit and HTTP suite covers protocol translation, validation, and the
+native route. Integration scripts exercise a running adapter and backend with a
+real client and check actual tool calls and observed file contents, not just
+returned text.
 
 ```sh
 python -m unittest discover -s tests -v
 python scripts/live_protocol.py  # requires a running adapter and backend
 python scripts/live_multiturn.py  # native route; temporary file recovery and follow-up
+python scripts/live_claude_native.py  # Claude Code through FCC, two resumed turns
 ```
+
+Local translation and validation add negligible time relative to inference.
+Tool-call reliability depends on the upstream model and quantization; the
+adapter validates arguments and retries malformed output once.
 
 Protocol notes: [`docs/protocol-research.md`](docs/protocol-research.md).
 
