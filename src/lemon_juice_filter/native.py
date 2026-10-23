@@ -7,26 +7,15 @@ import re
 from pathlib import Path
 import shutil
 
+from .policy import (compact_observation, needs_retry, repeated_observation,
+    repair_command, repetition_instruction, retry_instruction, turn_start)
 from .protocol import ProtocolError, normalize_request, parse_decision, schema_for_prompt, text_content
-
-
-_PROMISED_ACTION = re.compile(
-    r"(?i)\b(?:i(?:'ll| will| am going to| need to)|let me|next,? i(?:'ll| will)|i'm going to)\b"
-    r"[^.\n]{0,120}?\b(?:read|open|inspect|check|list|run|execute|look|verify|search|find|"
-    r"create|write|edit|update|use|call|query)\b")
-
-
-def promises_action(text):
-    """True when the model narrated a next step instead of performing it."""
-    return bool(text) and bool(_PROMISED_ACTION.search(text))
 
 
 def unresolved_failures(messages):
     """Track failures within the current user turn, across diagnostic calls."""
     names, pending = {}, set()
-    for message in messages:
-        if message['role'] == 'user':
-            pending.clear()
+    for message in messages[turn_start(messages):]:
         for call in message.get('tool_calls') or []:
             names[call['id']] = call['function']['name']
         if message['role'] != 'tool':
@@ -101,11 +90,13 @@ async def generate_native(body, app, post_generation, upstream_model):
                     rendered.append('<tool_call>\n' + json.dumps({'name': fn['name'],
                         'arguments': arguments}, ensure_ascii=False) + '\n</tool_call>')
                 message['content'] = '\n'.join(rendered)
-        if message['role'] == 'tool' and upstream_model.startswith('Qwen3-'):
-            output = text_content(message['content'])
-            if message.get('is_error') is True:
-                output = 'Tool execution failed:\n' + output
-            message = {'role': 'user', 'content': '<tool_response>\n' + output + '\n</tool_response>'}
+        if message['role'] == 'tool':
+            message['content'] = compact_observation(text_content(message['content']))
+            if upstream_model.startswith('Qwen3-'):
+                output = message['content']
+                if message.get('is_error') is True:
+                    output = 'Tool execution failed:\n' + output
+                message = {'role': 'user', 'content': '<tool_response>\n' + output + '\n</tool_response>'}
         messages.append(message)
     payload = {k: v for k, v in body.items() if k in (
         'tools', 'tool_choice', 'parallel_tool_calls', 'temperature', 'top_p', 'top_k',
@@ -120,7 +111,8 @@ async def generate_native(body, app, post_generation, upstream_model):
             'parameters': schema_for_prompt(tool['function'].get('parameters', {'type': 'object'}))}}
             for tool in body.get('tools') or []]
         thinking = payload.get('chat_template_kwargs', {}).get('enable_thinking', True)
-        payload.setdefault('temperature', 0.6 if thinking else 0.7)
+        # Agent loops need repeatable tool choices more than reply variety.
+        payload.setdefault('temperature', 0.6 if thinking else 0.3)
         payload.setdefault('top_p', 0.95 if thinking else 0.8)
         payload.setdefault('top_k', 20)
         payload.setdefault('min_p', 0)
@@ -129,13 +121,22 @@ async def generate_native(body, app, post_generation, upstream_model):
             # switch must also be present in the rendered conversation.
             messages.append({'role': 'system', 'content': '/no_think'})
     if os.getenv('LEMON_NATIVE_DEBUG') == '1':
+        logging.getLogger('lemon_juice_filter').info('native body shapes=%s',
+            [(m.get('role'), len(m.get('tool_calls') or []), m.get('tool_call_id') is not None,
+              len(m['content']) if isinstance(m.get('content'), str) else -1)
+             for m in body.get('messages', [])])
         logging.getLogger('lemon_juice_filter').info('native request options=%s tools=%s message_shapes=%s',
             {k: payload.get(k) for k in ('temperature', 'top_p', 'top_k', 'tool_choice', 'chat_template_kwargs')},
             [tool.name for tool in tools],
             [(m['role'], type(m.get('content')).__name__, len(m.get('content') or ''),
               len(m.get('tool_calls', []))) for m in messages])
     async with app.state.gate:
-        for attempt in range(2):
+        # A duplicate call and a narrated action can occur in one turn: the
+        # duplicate correction yields text, which still needs its own
+        # correction. Each kind fires once, and at most two corrections fit in
+        # the three generations, so the loop stays bounded.
+        corrected, invalid = set(), 0
+        for attempt in range(3):
             # Buffered thinking can legitimately exceed the legacy 240s read
             # timeout. Keep a bound while allowing the declared token budget.
             response = await post_generation(payload, read_timeout=max(240, min(600, payload['max_tokens'] / 8 + 30)))
@@ -157,6 +158,22 @@ async def generate_native(body, app, post_generation, upstream_model):
                 decision = parse_decision(json.dumps({'tool_calls': calls}) if calls else content,
                     tools, body.get('tool_choice'), parallel=False)
                 if decision.calls:
+                    for call in decision.calls:
+                        if call.name in ('bash', 'Bash'):
+                            call.arguments['command'] = repair_command(call.arguments.get('command'))
+                    observation = repeated_observation(decision.calls, body.get('messages', []))
+                    if observation is not None and 'duplicate' not in corrected and attempt < 2 and body.get('tool_choice') != 'none':
+                        # A duplicate cannot change the result. One correction
+                        # with a forced call replaces an unbounded client loop.
+                        corrected.add('duplicate')
+                        if os.getenv('LEMON_NATIVE_DEBUG') == '1':
+                            logging.getLogger('lemon_juice_filter').info(
+                                'native duplicate call=%s arguments=%s', decision.calls[0].name,
+                                decision.calls[0].arguments)
+                        payload['tool_choice'] = 'required'
+                        payload['messages'] = messages + [{'role': 'user', 'content':
+                            repetition_instruction(decision.calls[0], observation)}]
+                        continue
                     await validate_shell(decision.calls)
                     # Do not expose the redundant raw call markup to clients.
                     message['content'] = None
@@ -167,14 +184,17 @@ async def generate_native(body, app, post_generation, upstream_model):
                     # A small model can treat the first failed command as the
                     # end of the task. Give it one bounded chance to recover;
                     # never force execution or suppress a genuine blocker.
-                    if not attempt and tools and body.get('tool_choice') != 'none' and promises_action(decision.text):
-                        # The model announced the next step instead of taking it.
-                        # One bounded retry; the client still controls the loop.
-                        payload['messages'] = messages + [{'role': 'system', 'content':
-                            'Your last reply announced an action but did not call a tool. '
-                            'Emit the tool call now with the exact arguments; do not describe or simulate it.'}]
+                    reason = needs_retry(decision.text, body.get('messages', []), tools)
+                    if reason and reason not in corrected and attempt < 2 and body.get('tool_choice') != 'none':
+                        # One bounded retry with the tool call forced, so the
+                        # model cannot answer from assumption. The client still
+                        # controls the outer loop.
+                        corrected.add(reason)
+                        payload['tool_choice'] = 'required'
+                        payload['messages'] = messages + [{'role': 'system', 'content': retry_instruction(reason)}]
                         continue
-                    if not attempt and tools and pending_failures and body.get('tool_choice') != 'none':
+                    if tools and pending_failures and 'failure' not in corrected and attempt < 2 and body.get('tool_choice') != 'none':
+                        corrected.add('failure')
                         payload['messages'] = messages + [{'role': 'system', 'content':
                             'A tool failed and has not subsequently succeeded; the original task is still pending. '
                             'Reconsider whether a safe diagnostic or corrected tool call can resolve it. '
@@ -188,8 +208,15 @@ async def generate_native(body, app, post_generation, upstream_model):
                     message['content'] = decision.text
                 break
             except ProtocolError as exc:
-                if attempt:
+                if os.getenv('LEMON_NATIVE_DEBUG') == '1':
+                    logging.getLogger('lemon_juice_filter').warning(
+                        'native invalid attempt=%s reason=%s finish=%s reasoning_len=%s usage=%s '
+                        'content=%r tool_calls=%r', attempt, exc, item.get('finish_reason'),
+                        len(message.get('reasoning_content') or ''), data.get('usage'),
+                        (message.get('content') or '')[-3000:], message.get('tool_calls'))
+                if invalid:
                     raise ProtocolError('Native output remained invalid after one repair: ' + str(exc)) from exc
+                invalid += 1
                 payload['messages'] = messages + [{'role': 'system', 'content':
                     'Correct the response format or tool arguments: ' + str(exc) +
                     ' Use only the declared tools. Return an actual tool call if work remains, '

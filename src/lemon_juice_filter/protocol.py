@@ -208,7 +208,9 @@ def _unwrap(text: str) -> str:
     text = re.sub(r'^```(?:json|xml)?\s*', '', text, flags=re.I)
     text = re.sub(r'`{3,}\s*$', '', text).strip()
     for tag in ('response', 'tool_call'):
-        match = re.fullmatch(rf'<{tag}>\s*(.*?)\s*</{tag}>', text, re.S | re.I)
+        # Small models sometimes stop after a complete object without emitting
+        # the closing tag. Accept both shapes when the tag opens the response.
+        match = re.fullmatch(rf'<{tag}>\s*(.*?)\s*(?:</{tag}>)?', text, re.S | re.I)
         if match:
             return _unwrap(match.group(1))
     return text
@@ -239,16 +241,34 @@ def decode_model_json(raw: str):
     return json.loads(''.join(result))
 
 
+def _decode_with_trailing_junk(raw: str):
+    """Decode a response that opens with one object and ends in stray closers."""
+    stripped = raw.lstrip()
+    if not stripped.startswith(('{', '[')):
+        return None
+    start = len(raw) - len(stripped)
+    try:
+        obj, end = json.JSONDecoder().raw_decode(raw, start)
+    except json.JSONDecodeError:
+        return None
+    tail = raw[end:].strip()
+    if re.fullmatch(r'(?:</tool_call>)?\s*[}\]]*', tail, re.I):
+        return obj
+    return None
+
+
 def parse_decision(text: str, tools: list[Tool], choice: Any = None, parallel: bool = True, require_envelope: bool = False) -> Decision:
     raw = _unwrap(text)
     try:
         obj = decode_model_json(raw)
     except json.JSONDecodeError as exc:
-        if raw.startswith(('{', '[', '<tool_call>', '<response>')) and re.search(r'"(?:tool_calls|tool_call|arguments)"|<tool_call>|<response>', raw):
-            raise ProtocolError('Malformed tool-call JSON; return a complete object.') from exc
-        if require_envelope:
-            raise ProtocolError('Return a JSON tool decision or an object whose final key contains your actual answer. If an operation remains, call its tool instead of describing or simulating it.') from exc
-        return _validate_choice(Decision(text=text), choice)
+        obj = _decode_with_trailing_junk(raw)
+        if obj is None:
+            if raw.startswith(('{', '[', '<tool_call>', '<response>')) and re.search(r'"(?:tool_calls|tool_call|arguments)"|<tool_call>|<response>', raw):
+                raise ProtocolError('Malformed tool-call JSON; return a complete object.') from exc
+            if require_envelope:
+                raise ProtocolError('Return a JSON tool decision or an object whose final key contains your actual answer. If an operation remains, call its tool instead of describing or simulating it.') from exc
+            return _validate_choice(Decision(text=text), choice)
     if isinstance(obj, dict) and set(obj) == {'final'} and isinstance(obj['final'], str):
         return _validate_choice(Decision(text=obj['final']), choice)
     # Observed after a directory result: the model spells the final envelope
@@ -294,7 +314,11 @@ def parse_decision(text: str, tools: list[Tool], choice: Any = None, parallel: b
             raise ProtocolError('Each tool action needs a name string. For a completed task, return a top-level final string instead of a tool action.')
         name = fn.get('name')
         if name not in declared:
-            raise ProtocolError(f'Undeclared tool: {name}. Use an exact available name.')
+            hint = ''
+            if 'Bash' in declared:
+                hint = (' Shell commands are not tools: run them through Bash, for example '
+                        '{"name":"Bash","arguments":{"command":"pwd"}}.')
+            raise ProtocolError(f'Undeclared tool: {name}. Use an exact available name.{hint}')
         args = fn.get('arguments', fn.get('input'))
         if isinstance(args, str):
             try:

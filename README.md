@@ -69,8 +69,16 @@ Qwen3 uses its recommended sampling defaults and canonical tool-history markup
 for RyzenAI compatibility. Shell calls are syntax-checked with `bash -n` when
 Bash is installed; invalid calls get one repair attempt. A reply that announces
 an action without calling a tool gets one retry asking for the call itself.
-Output is buffered for validation, including reasoning, so this path does not
-stream tokens as generated.
+Repeated identical calls are intercepted: the model is shown the result it
+already received instead of executing the duplicate again. Turn tracking
+ignores the control-only user messages some clients inject after a tool
+result, such as Claude Code's live token-budget line, so a tool loop stays one
+turn. A multi-word `cd` path without quotes is quoted before validation,
+because Bash rejects that form outright; a path that already escapes its space
+is left alone. Tool markup with a missing closing tag or a stray extra brace is
+recovered when the JSON object itself is complete. Output is buffered for
+validation, including reasoning, so this path does not stream tokens as
+generated.
 
 `scripts/configure_fcc.py --native --no-thinking` registers the route that
 disables thinking. RyzenAI 1.7 ignores `chat_template_kwargs`, so the adapter
