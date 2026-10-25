@@ -68,9 +68,11 @@ register this route in FCC. FCC's reasoning policy must allow client requests.
 Qwen3 uses its recommended sampling defaults and canonical tool-history markup
 for RyzenAI compatibility. Shell calls are syntax-checked with `bash -n` when
 Bash is installed; invalid calls get one repair attempt. A reply that announces
-an action without calling a tool gets one retry asking for the call itself.
-Repeated identical calls are intercepted: the model is shown the result it
-already received instead of executing the duplicate again. Turn tracking
+an action without calling a tool gets one retry asking for the call itself, and
+a reply that gives up after a failed tool gets up to two reconsiderations before
+the explanation is returned. Repeated identical calls are intercepted: the model
+is shown the result it already received instead of executing the duplicate again;
+if it still insists, the turn ends with that observation instead of looping. Turn tracking
 ignores the control-only user messages some clients inject after a tool
 result, such as Claude Code's live token-budget line, so a tool loop stays one
 turn. A multi-word `cd` path without quotes is quoted before validation,

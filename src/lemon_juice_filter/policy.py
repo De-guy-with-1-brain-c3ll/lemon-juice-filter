@@ -36,8 +36,13 @@ OBSERVATION_TAIL = 2000
 
 def is_control_message(content):
     """True for a client control line that carries no user request."""
-    if not isinstance(content, str) or not content.strip():
+    if content is None:
+        return True
+    if not isinstance(content, str):
+        # Structured content is a genuine message, not a control line.
         return False
+    if not content.strip():
+        return True
     return not _CONTROL_TAGS.sub('', content).strip()
 
 
@@ -45,7 +50,8 @@ def turn_start(messages):
     """Index of the last genuine user message, ignoring client control lines."""
     for index in range(len(messages) - 1, -1, -1):
         message = messages[index]
-        if message.get('role') == 'user' and not is_control_message(message.get('content')):
+        if isinstance(message, dict) and message.get('role') == 'user' \
+                and not is_control_message(message.get('content')):
             return index
     return 0
 
@@ -60,12 +66,27 @@ def claims_file_contents(text):
     return bool(text) and bool(_FILE_CLAIM.search(text))
 
 
+def _calls(message):
+    """Yield well-formed historical calls; malformed history is ignored."""
+    if not isinstance(message, dict):
+        return
+    calls = message.get('tool_calls')
+    if not isinstance(calls, list):
+        return
+    for call in calls:
+        if not isinstance(call, dict) or not isinstance(call.get('id'), str):
+            continue
+        function = call.get('function')
+        if not isinstance(function, dict):
+            function = {}
+        yield call['id'], function
+
+
 def _commands(messages):
     """Map tool_call_id to (name, command) for every call in the history."""
     names = {}
     for message in messages:
-        for call in message.get('tool_calls') or []:
-            function = call.get('function') or {}
+        for call_id, function in _calls(message):
             argument = function.get('arguments')
             command = None
             if isinstance(argument, str):
@@ -75,7 +96,7 @@ def _commands(messages):
                     command = argument
             elif isinstance(argument, dict):
                 command = argument.get('command')
-            names[call.get('id')] = (function.get('name'), command)
+            names[call_id] = (function.get('name'), command)
     return names
 
 
@@ -84,7 +105,7 @@ def read_evidence(messages):
     start = turn_start(messages)
     names = _commands(messages)
     for message in messages[start:]:
-        if message.get('role') != 'tool':
+        if not isinstance(message, dict) or message.get('role') != 'tool':
             continue
         name, command = names.get(message.get('tool_call_id'), (None, None))
         if name == 'Read':
@@ -123,13 +144,13 @@ def repeated_observation(calls, messages):
     start = turn_start(messages)
     signatures, observed = {}, {}
     for message in messages[start:]:
-        for call in message.get('tool_calls') or []:
-            function = call.get('function') or {}
-            signatures[call.get('id')] = _signature(function.get('name'), function.get('arguments'))
-        if message.get('role') == 'tool':
-            signature = signatures.get(message.get('tool_call_id'))
-            if signature is not None:
-                observed[signature] = message.get('content')
+        for call_id, function in _calls(message):
+            signatures[call_id] = _signature(function.get('name'), function.get('arguments'))
+        if not isinstance(message, dict) or message.get('role') != 'tool':
+            continue
+        signature = signatures.get(message.get('tool_call_id'))
+        if signature is not None:
+            observed[signature] = message.get('content')
     for call in calls:
         signature = _signature(call.name, call.arguments)
         if signature in observed:
@@ -173,8 +194,18 @@ def retry_instruction(reason):
 
 def compact_observation(text, limit=OBSERVATION_LIMIT):
     """Bound one tool observation so a large result cannot crowd out the request."""
+    limit = max(0, limit)
     if not text or len(text) <= limit:
         return text
-    head = limit - OBSERVATION_TAIL - 80
-    removed = len(text) - head - OBSERVATION_TAIL
-    return text[:head] + f'\n... [{removed} characters omitted] ...\n' + text[-OBSERVATION_TAIL:]
+    # Keep both ends of the result. A limit smaller than the preferred tail
+    # must shrink the tail instead of making the head negative.
+    tail = min(OBSERVATION_TAIL, limit // 4)
+    head = max(0, limit - tail - 80)
+    removed = len(text) - head - tail
+    budget = limit - head - tail
+    marker = f'\n... [{removed} characters omitted] ...\n'
+    if len(marker) > budget:
+        marker = '...'
+    if len(marker) > budget:
+        return text[:limit]
+    return text[:head] + marker + (text[-tail:] if tail else '')

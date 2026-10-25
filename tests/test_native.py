@@ -101,7 +101,8 @@ class NativeTests(unittest.TestCase):
         app.state.client.post = AsyncMock(return_value=response(text='Access denied; cannot proceed.'))
         r = self.client.post('/native/v1/chat/completions', json=self.failed_history())
         self.assertEqual(r.status_code, 200)
-        self.assertEqual(app.state.client.post.call_count, 2)
+        self.assertEqual(app.state.client.post.call_count, 3)
+        self.assertEqual(app.state.client.post.call_args.kwargs['json']['tool_choice'], 'required')
         self.assertIn('Access denied', r.json()['choices'][0]['message']['content'])
 
     def test_tool_choice_none_disables_recovery(self):
@@ -199,6 +200,32 @@ class NativeTests(unittest.TestCase):
         self.assertIn('already called bash', retry['messages'][-1]['content'])
         self.assertIn('No such file or directory', retry['messages'][-1]['content'])
 
+    def test_tool_call_printed_in_a_fence_is_still_executed(self):
+        text = ('1. List the project directory\n\n```json\n'
+                '{"name": "bash", "arguments": {"command": "ls project"}}\n```')
+        app.state.client.post = AsyncMock(return_value=response(text=text))
+        r = self.client.post('/native/v1/chat/completions', json=self.body)
+        self.assertEqual(r.status_code, 200)
+        choice = r.json()['choices'][0]
+        self.assertEqual(choice['finish_reason'], 'tool_calls')
+        self.assertIsNone(choice['message']['content'])
+        self.assertEqual(json.loads(choice['message']['tool_calls'][0]['function']['arguments']),
+                         {'command': 'ls project'})
+
+    def test_persistent_duplicate_ends_with_the_observation(self):
+        messages = self.body['messages'] + [
+            {'role': 'assistant', 'content': '', 'tool_calls': [{'id': 'c1', 'type': 'function',
+                'function': {'name': 'bash', 'arguments': json.dumps({'command': 'ls'})}}]},
+            {'role': 'tool', 'tool_call_id': 'c1', 'content': 'a b c'}]
+        app.state.client.post = AsyncMock(side_effect=[response('ls'), response('ls'), response('ls')])
+        r = self.client.post('/native/v1/chat/completions', json={**self.body, 'messages': messages})
+        self.assertEqual(r.status_code, 200)
+        choice = r.json()['choices'][0]
+        self.assertEqual(choice['finish_reason'], 'stop')
+        self.assertNotIn('tool_calls', choice['message'])
+        self.assertIn('a b c', choice['message']['content'])
+        self.assertEqual(app.state.client.post.call_count, 3)
+
     def test_narrated_action_after_a_duplicate_correction_still_gets_one(self):
         messages = self.body['messages'] + [
             {'role': 'assistant', 'content': '', 'tool_calls': [{'id': 'c1', 'type': 'function',
@@ -211,6 +238,29 @@ class NativeTests(unittest.TestCase):
         self.assertEqual(r.json()['choices'][0]['finish_reason'], 'tool_calls')
         self.assertEqual(app.state.client.post.call_count, 3)
         self.assertIn('announced an action', app.state.client.post.call_args.kwargs['json']['messages'][-1]['content'])
+
+    def test_protocol_repair_keeps_an_earlier_correction(self):
+        messages = self.body['messages'] + [
+            {'role': 'assistant', 'content': '', 'tool_calls': [{'id': 'c1', 'type': 'function',
+                'function': {'name': 'bash', 'arguments': json.dumps({'command': 'ls'})}}]},
+            {'role': 'tool', 'tool_call_id': 'c1', 'content': 'a b c'}]
+        app.state.client.post = AsyncMock(side_effect=[
+            response('ls'), response(text=''), response('ls -d */')])
+        r = self.client.post('/native/v1/chat/completions', json={**self.body, 'messages': messages})
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(r.json()['choices'][0]['finish_reason'], 'tool_calls')
+        self.assertEqual(app.state.client.post.call_count, 3)
+        contents = [m['content'] for m in app.state.client.post.call_args.kwargs['json']['messages']]
+        self.assertTrue(any('already called bash' in content for content in contents))
+        self.assertIn('Correct the response format', contents[-1])
+
+    def test_tool_choice_none_does_not_force_a_retry(self):
+        app.state.client.post = AsyncMock(return_value=response(text="I'll list the files."))
+        body = {**self.body, 'tool_choice': {'type': 'none'}}
+        r = self.client.post('/native/v1/chat/completions', json=body)
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(app.state.client.post.call_count, 1)
+        self.assertEqual(r.json()['choices'][0]['message']['content'], "I'll list the files.")
 
     def test_extra_closing_brace_after_a_complete_call_is_ignored(self):
         raw = '<tool_call>\n{"name":"bash","arguments":{"command":"ls"}}}'

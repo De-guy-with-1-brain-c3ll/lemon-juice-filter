@@ -13,6 +13,10 @@ class ProtocolError(ValueError):
     pass
 
 
+class TruncationError(ProtocolError):
+    """The backend stopped at max_tokens; a repair cannot change that."""
+
+
 @dataclass
 class Tool:
     name: str
@@ -42,9 +46,14 @@ def text_content(content: Any) -> str:
         raise ProtocolError('Message content must be a string or content-block list.')
     parts = []
     for block in content:
+        if not isinstance(block, dict):
+            raise ProtocolError('Each content block must be an object.')
         kind = block.get('type')
         if kind in ('text', 'input_text', 'output_text'):
-            parts.append(block.get('text', ''))
+            text = block.get('text', '')
+            if not isinstance(text, str):
+                raise ProtocolError('Text content blocks must contain a text string.')
+            parts.append(text)
         elif kind in ('thinking', 'redacted_thinking'):
             continue
         else:
@@ -71,16 +80,32 @@ def tool_result_payload(call_id: str, name: str, content: Any, is_error: bool = 
 
 
 def normalize_request(body: dict, wire: str) -> tuple[list[dict], list[Tool]]:
+    if not isinstance(body, dict):
+        raise ProtocolError('The request body must be a JSON object.')
     tools = []
-    for item in body.get('tools') or []:
+    raw_tools = body.get('tools') or []
+    if not isinstance(raw_tools, list):
+        raise ProtocolError('tools must be a list.')
+    for item in raw_tools:
+        if not isinstance(item, dict):
+            raise ProtocolError('Each tool must be an object.')
         if wire == 'openai':
             if item.get('type') != 'function':
                 raise ProtocolError('Only client function tools are supported.')
-            fn = item['function']
-            tools.append(Tool(fn['name'], fn.get('description', ''), fn.get('parameters', {'type': 'object'})))
+            fn = item.get('function')
+            if not isinstance(fn, dict) or not isinstance(fn.get('name'), str):
+                raise ProtocolError('Each OpenAI tool needs a function object with a name.')
+            schema = fn.get('parameters')
+            if schema is None:
+                schema = {'type': 'object'}
+            if not isinstance(schema, (dict, bool)):
+                raise ProtocolError(f'Tool parameters for {fn["name"]} must be an object schema.')
+            tools.append(Tool(fn['name'], fn.get('description', ''), schema))
         else:
-            if 'name' not in item or 'input_schema' not in item:
+            if not isinstance(item.get('name'), str) or 'input_schema' not in item:
                 raise ProtocolError('Only explicit client tools with input_schema are supported.')
+            if not isinstance(item['input_schema'], (dict, bool)):
+                raise ProtocolError(f'Tool input_schema for {item["name"]} must be an object schema.')
             tools.append(Tool(item['name'], item.get('description', ''), item['input_schema']))
     if len({t.name for t in tools}) != len(tools):
         raise ProtocolError('Duplicate tool names are not allowed.')
@@ -92,15 +117,24 @@ def normalize_request(body: dict, wire: str) -> tuple[list[dict], list[Tool]]:
     messages = []
     if body.get('system'):
         messages.append({'role': 'system', 'content': text_content(body['system'])})
+    raw_messages = body.get('messages') or []
+    if not isinstance(raw_messages, list):
+        raise ProtocolError('messages must be a list.')
     names = {}
     seen_calls = set()
     seen_results = set()
-    for message in body.get('messages', []):
+    for message in raw_messages:
+        if not isinstance(message, dict):
+            raise ProtocolError('Each message must be an object.')
         role = message.get('role')
         if role not in ('system', 'developer', 'user', 'assistant', 'tool'):
             raise ProtocolError(f'Unsupported message role: {role}')
         if role == 'tool':
             call_id = message.get('tool_call_id')
+            if not isinstance(call_id, str):
+                raise ProtocolError('tool_call_id must be a string.')
+            if message.get('tool_calls'):
+                raise ProtocolError('Tool result messages cannot contain tool_calls.')
             if call_id not in seen_calls or call_id in seen_results:
                 raise ProtocolError('Unmatched or duplicate tool result ID.')
             seen_results.add(call_id)
@@ -111,15 +145,21 @@ def normalize_request(body: dict, wire: str) -> tuple[list[dict], list[Tool]]:
         parts = []
         if isinstance(content, list):
             for block in content:
+                if not isinstance(block, dict):
+                    raise ProtocolError('Each content block must be an object.')
                 if block.get('type') == 'tool_use':
-                    call_id = block['id']
+                    call_id = block.get('id')
+                    if not isinstance(call_id, str) or not isinstance(block.get('name'), str):
+                        raise ProtocolError('Each tool_use block needs an id and a name.')
                     if call_id in seen_calls:
                         raise ProtocolError('Duplicate tool call ID.')
                     seen_calls.add(call_id)
                     names[call_id] = block['name']
-                    parts.append(json.dumps({'tool_calls': [{'id': call_id, 'name': block['name'], 'arguments': block['input']}]}))
+                    parts.append(json.dumps({'tool_calls': [{'id': call_id, 'name': block['name'], 'arguments': block.get('input')}]}))
                 elif block.get('type') == 'tool_result':
-                    call_id = block['tool_use_id']
+                    call_id = block.get('tool_use_id')
+                    if not isinstance(call_id, str):
+                        raise ProtocolError('tool_use_id must be a string.')
                     if call_id not in seen_calls or call_id in seen_results:
                         raise ProtocolError('Unmatched or duplicate tool result ID.')
                     seen_results.add(call_id)
@@ -129,13 +169,21 @@ def normalize_request(body: dict, wire: str) -> tuple[list[dict], list[Tool]]:
                     parts.append(text_content([block]))
         else:
             parts.append(text_content(content))
-        for call in message.get('tool_calls') or []:
-            call_id = call['id']
+        tool_calls = message.get('tool_calls') or []
+        if not isinstance(tool_calls, list):
+            raise ProtocolError('tool_calls must be a list.')
+        for call in tool_calls:
+            if not isinstance(call, dict):
+                raise ProtocolError('Each tool call must be an object.')
+            call_id = call.get('id')
+            fn = call.get('function')
+            if not isinstance(call_id, str) or not isinstance(fn, dict) or not isinstance(fn.get('name'), str):
+                raise ProtocolError('Each historical tool call needs an id and a function name.')
             if call_id in seen_calls:
                 raise ProtocolError('Duplicate tool call ID.')
             seen_calls.add(call_id)
-            names[call_id] = call['function']['name']
-            arguments = call['function']['arguments']
+            names[call_id] = fn['name']
+            arguments = fn.get('arguments')
             try:
                 arguments = json.loads(arguments) if isinstance(arguments, str) else arguments
             except json.JSONDecodeError as exc:
@@ -176,9 +224,10 @@ def tool_prompt(tools: list[Tool], choice: Any = None) -> str:
                     'parameters': schema_for_prompt(t.schema)} for t in tools]
     inventory = []
     for tool in tools:
-        properties = tool.schema.get('properties', {})
+        schema = tool.schema if isinstance(tool.schema, dict) else {}
+        properties = schema.get('properties', {})
         required = ', '.join(json.dumps(name) + ' (' + str(properties.get(name, {}).get('type', 'see schema')) + ')'
-                             for name in tool.schema.get('required', [])) or 'none'
+                             for name in schema.get('required', [])) or 'none'
         summary = tool.description.split('\n', 1)[0][:160]
         inventory.append(f'- {json.dumps(tool.name)}: {summary} Required arguments: {required}.')
     return (
@@ -337,6 +386,30 @@ def parse_decision(text: str, tools: list[Tool], choice: Any = None, parallel: b
     return _validate_choice(Decision(calls=calls), choice)
 
 
+def embedded_tool_decision(text: str, tools: list[Tool], choice: Any = None):
+    """Recover a tool call the model printed inside a fence or tag instead of acting.
+
+    Small models sometimes narrate a call in markdown. Treating that text as a
+    final answer stalls the agent, so re-parse the enclosed object. A fenced
+    object that looks like a call but fails validation is a real error and is
+    raised for the normal repair path.
+    """
+    if not text or not tools:
+        return None
+    candidates = re.findall(r'```(?:json)?\s*(.*?)```', text, re.S | re.I)
+    candidates += re.findall(r'<tool_call>\s*(.*?)\s*</tool_call>', text, re.S | re.I)
+    for candidate in candidates:
+        try:
+            decision = parse_decision(candidate, tools, choice, parallel=False)
+        except ProtocolError:
+            if re.search(r'"(?:tool_calls|arguments|input)"', candidate):
+                raise
+            continue
+        if decision.calls:
+            return decision
+    return None
+
+
 def _validate_choice(decision: Decision, choice: Any) -> Decision:
     if choice == 'none' or isinstance(choice, dict) and choice.get('type') == 'none':
         if decision.calls:
@@ -345,7 +418,12 @@ def _validate_choice(decision: Decision, choice: Any) -> Decision:
         if not decision.calls:
             raise ProtocolError('A tool call is required.')
     if isinstance(choice, dict) and choice.get('type') in ('tool', 'function'):
-        name = choice.get('name') or choice.get('function', {}).get('name')
+        function = choice.get('function')
+        name = choice.get('name')
+        if not isinstance(name, str) and isinstance(function, dict):
+            name = function.get('name')
+        if not isinstance(name, str):
+            raise ProtocolError('A specific tool is required but no tool name was provided.')
         if not decision.calls or any(c.name != name for c in decision.calls):
             raise ProtocolError(f'This request requires the exact tool {name}.')
     return decision

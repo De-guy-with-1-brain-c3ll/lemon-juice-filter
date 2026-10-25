@@ -11,7 +11,8 @@ import httpx
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
-from .protocol import ProtocolError, normalize_request, parse_decision, schema_for_prompt, tool_prompt
+from .protocol import (ProtocolError, TruncationError, normalize_request, parse_decision,
+    schema_for_prompt, tool_prompt)
 from .native import generate_native
 
 log = logging.getLogger('lemon_juice_filter')
@@ -36,9 +37,21 @@ async def lifespan(app):
 app = FastAPI(title='lemon-juice-filter', version='0.1.0', lifespan=lifespan)
 
 
+async def read_body(request):
+    """Parse a JSON object, rejecting malformed client input as a 400."""
+    try:
+        body = await request.json()
+    except (ValueError, UnicodeDecodeError) as exc:
+        raise ProtocolError('Request body must be valid JSON.') from exc
+    if not isinstance(body, dict):
+        raise ProtocolError('The request body must be a JSON object.')
+    return body
+
+
 @app.middleware('http')
 async def local_only(request, call_next):
-    if request.client and request.client.host not in ('127.0.0.1', '::1', 'testclient'):
+    if request.client and request.client.host not in (
+            '127.0.0.1', '::1', '::ffff:127.0.0.1', 'testclient'):
         return JSONResponse({'error': {'message': 'Loopback clients only.'}}, status_code=403)
     if request.headers.get('origin'):
         # Coding agents do not need browser access. Do not enable ambient browser callers.
@@ -54,13 +67,14 @@ async def protocol_error(request, exc):
 @app.get('/health')
 async def health():
     return {'status': 'ok', 'model': MODEL, 'upstream_model': UPSTREAM_MODEL,
-            'context_window': CONTEXT, 'completed_requests': getattr(app.state, 'completed', 0)}
+            'context_window': getattr(app.state, 'context_window', CONTEXT),
+            'completed_requests': getattr(app.state, 'completed', 0)}
 
 
 @app.get('/v1/models')
 async def models():
     return {'object': 'list', 'data': [{'id': MODEL, 'type': 'model', 'object': 'model',
-        'display_name': 'Lemonade Qwen2.5 Coder Hybrid (adapted)', 'owned_by': 'local',
+        'display_name': f'{UPSTREAM_MODEL} (adapted)', 'owned_by': 'local',
         'created': 0, 'created_at': '1970-01-01T00:00:00Z', 'context_length': CONTEXT,
         'contextWindow': CONTEXT, 'maxCompletionTokens': MAX_OUTPUT,
         'supportsReasoning': False, 'inputModalities': ['text']}],
@@ -107,7 +121,8 @@ async def generate(body, wire):
     # reminder here displaced the actual task and encouraged redundant calls.
     last_is_result = bool(transcript and any(
         transcript[-1]['content'].startswith(prefix) for prefix in ('{"tool_result":', '{"tool_results":')))
-    if tools and not last_is_result:
+    tools_enabled = not (choice == 'none' or isinstance(choice, dict) and choice.get('type') == 'none')
+    if tools and tools_enabled and not last_is_result:
         upstream_messages.append({'role': 'user', 'content':
             'Respond to the latest user request above. If work remains, call one of the declared tools. '
             'Wait for its actual tool_result before continuing. Output ONLY one JSON tool_calls decision, '
@@ -115,11 +130,20 @@ async def generate(body, wire):
             'If the tool_result already contains what the user asked to see, answer from that data now. '
             'The key "final" belongs at the top level, never inside "tool_calls". '
             'Never output placeholder words or describe hypothetical file operations.'})
-    requested = body.get('max_tokens', body.get('max_completion_tokens', 1024))
+    requested = body.get('max_tokens')
+    if requested is None:
+        requested = body.get('max_completion_tokens')
+    if requested is None:
+        requested = 1024
     if not isinstance(requested, int) or isinstance(requested, bool) or requested <= 0:
         raise ProtocolError('max_tokens must be a positive integer.')
+    temperature = body.get('temperature')
+    if temperature is None:
+        temperature = 0
+    elif isinstance(temperature, bool) or not isinstance(temperature, (int, float)):
+        raise ProtocolError('temperature must be a number.')
     payload = {'model': UPSTREAM_MODEL, 'messages': upstream_messages, 'stream': False,
-        'max_tokens': min(requested, MAX_OUTPUT), 'temperature': body.get('temperature', 0)}
+        'max_tokens': min(requested, MAX_OUTPUT), 'temperature': temperature}
     # Agents may run all returned calls concurrently. Serialize model actions to
     # preserve read/write/edit dependencies; clients allowing parallelism do not require it.
     parallel = False
@@ -137,9 +161,12 @@ async def generate(body, wire):
                 if native:
                     raw = json.dumps({'tool_calls': native})
                 if item.get('finish_reason') == 'length' and tools:
-                    raise ProtocolError('Model output was truncated; reduce the requested operation or increase max_tokens.')
-                decision = parse_decision(raw, tools, choice, parallel, require_envelope=bool(tools))
+                    raise TruncationError('Model output was truncated; reduce the requested operation or increase max_tokens.')
+                decision = parse_decision(raw, tools, choice, parallel, require_envelope=bool(tools) and tools_enabled)
                 break
+            except TruncationError:
+                # Retrying with the same token budget would truncate identically.
+                raise
             except ProtocolError as exc:
                 if attempt:
                     raise ProtocolError('Model returned invalid tool output after one repair: ' + str(exc)) from exc
@@ -156,7 +183,9 @@ async def generate(body, wire):
                      'and arguments matching its schema. Do not invent completion tools or run a command '
                      'merely to announce completion. Do not execute anything yourself. '
                      'Latest user request: ' + pending + '\nTool call schemas: ' + json.dumps(catalog, ensure_ascii=False)}]
-    usage = data.get('usage') or {}
+    usage = data.get('usage')
+    if not isinstance(usage, dict):
+        usage = {}
     app.state.completed += 1
     log.info('completed request=%s wire=%s tools=%s repairs=%d seconds=%.2f',
              request_id, wire, [c.name for c in decision.calls], attempt, time.monotonic()-started)
@@ -229,7 +258,9 @@ async def handle(body, wire):
         try:
             decision, usage, finish = await generate(body, wire)
             return JSONResponse((anthropic_message if wire == 'anthropic' else openai_message)(decision, usage, finish))
-        except httpx.HTTPError:
+        except ProtocolError:
+            raise
+        except (httpx.HTTPError, TimeoutError, AttributeError, KeyError, IndexError, TypeError, ValueError):
             return JSONResponse({'type': 'error', 'error': {'type': 'api_error', 'message': 'Lemonade inference failed. Check the local backend.'}}, status_code=502)
 
     async def events():
@@ -243,7 +274,7 @@ async def handle(body, wire):
             message = (anthropic_message if wire == 'anthropic' else openai_message)(decision, usage, finish)
             for event in (anthropic_events(message) if wire == 'anthropic' else openai_events(message)):
                 yield event
-        except (ProtocolError, httpx.HTTPError, KeyError, ValueError) as exc:
+        except (ProtocolError, httpx.HTTPError, TimeoutError, AttributeError, KeyError, IndexError, TypeError, ValueError) as exc:
             error = {'type': 'error', 'error': {'type': 'api_error', 'message':
                 str(exc) if isinstance(exc, ProtocolError) else 'Local inference returned an invalid or unavailable response.'}}
             yield sse(error, 'error' if wire == 'anthropic' else None)
@@ -257,12 +288,12 @@ async def handle(body, wire):
 
 @app.post('/v1/messages')
 async def messages(request: Request):
-    return await handle(await request.json(), 'anthropic')
+    return await handle(await read_body(request), 'anthropic')
 
 
 @app.post('/v1/chat/completions')
 async def completions(request: Request):
-    return await handle(await request.json(), 'openai')
+    return await handle(await read_body(request), 'openai')
 
 
 @app.get('/native/v1/models')
@@ -273,8 +304,7 @@ async def native_models():
 
 @app.post('/native/v1/chat/completions')
 async def native_completions(request: Request):
-    body = await request.json()
-    return await handle_native(body)
+    return await handle_native(await read_body(request))
 
 
 @app.get('/native/no-thinking/v1/models')
@@ -286,7 +316,7 @@ async def native_fast_models():
 
 @app.post('/native/no-thinking/v1/chat/completions')
 async def native_fast_completions(request: Request):
-    body = await request.json()
+    body = await read_body(request)
     kwargs = body.get('chat_template_kwargs', {})
     if not isinstance(kwargs, dict):
         raise ProtocolError('chat_template_kwargs must be an object.')
@@ -298,7 +328,9 @@ async def handle_native(body):
     if not body.get('stream'):
         try:
             return JSONResponse(await generate_native(body, app, post_generation, UPSTREAM_MODEL))
-        except httpx.HTTPError:
+        except ProtocolError:
+            raise
+        except (httpx.HTTPError, TimeoutError, AttributeError, KeyError, IndexError, TypeError, ValueError):
             return JSONResponse({'error': {'message': 'Lemonade inference failed.'}}, status_code=502)
 
     async def events():
@@ -310,7 +342,7 @@ async def handle_native(body):
                     yield ': ping\n\n'
             for event in openai_events(task.result()):
                 yield event
-        except (ProtocolError, httpx.HTTPError, ValueError, KeyError) as exc:
+        except (ProtocolError, httpx.HTTPError, TimeoutError, AttributeError, KeyError, IndexError, TypeError, ValueError) as exc:
             yield sse({'error': {'type': 'api_error', 'message': str(exc) if isinstance(exc, ProtocolError)
                 else 'Native inference failed.'}})
         finally:
@@ -323,7 +355,7 @@ async def handle_native(body):
 
 @app.post('/v1/messages/count_tokens')
 async def count_tokens(request: Request):
-    body = await request.json()
+    body = await read_body(request)
     normalize_request(body, 'anthropic')
     # A conservative estimate, not a tokenizer claim. Never silently trim history.
     return JSONResponse({'input_tokens': max(1, len(json.dumps(body, ensure_ascii=False)) // 3)},

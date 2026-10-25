@@ -48,7 +48,13 @@ with tempfile.TemporaryDirectory() as directory:
                 args = json.loads(call['function']['arguments'])
                 print(f'Fixture tool: {name} {args}', flush=True)
                 target = (root / args['path']).resolve()
-                assert target.is_relative_to(root), 'Model failed to correct the invalid fixture path'
+                if not target.is_relative_to(root):
+                    # A real client executes the call and returns the filesystem
+                    # error. Refusing it here would test the harness, not recovery.
+                    messages.append({'role': 'tool', 'tool_call_id': call['id'],
+                                     'content': 'Error: No such file or directory', 'is_error': True})
+                    calls += 1
+                    continue
                 try:
                     output = target.read_text(encoding='utf-8') if name == 'read' else '\n'.join(p.name for p in target.iterdir())
                     error = False
